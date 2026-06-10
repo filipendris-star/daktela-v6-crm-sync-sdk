@@ -35,27 +35,90 @@ final class YamlMappingLoader
             throw ConfigurationException::invalidMappingFile($filePath, 'Missing or invalid "lookup_field" key');
         }
 
-        if (!isset($data['mappings']) || !is_array($data['mappings'])) {
+        $hasLegacy = isset($data['mappings']);
+        $hasStructured = isset($data['default']) || isset($data['types']);
+
+        if ($hasLegacy && $hasStructured) {
+            throw ConfigurationException::invalidMappingFile(
+                $filePath,
+                'Use either top-level "mappings" or "default"/"types", not both',
+            );
+        }
+
+        if (!$hasLegacy && !$hasStructured) {
             throw ConfigurationException::invalidMappingFile($filePath, 'Missing or invalid "mappings" key');
         }
 
-        $mappings = [];
-        foreach ($data['mappings'] as $index => $item) {
-            if (!is_array($item)) {
-                throw ConfigurationException::invalidMappingFile(
-                    $filePath,
-                    sprintf('Mapping at index %d must be an array', $index),
-                );
+        if ($hasLegacy) {
+            $base = $this->parseMappingList($filePath, $data['mappings'], 'mappings');
+            $typeMappings = [];
+        } else {
+            $base = [];
+            if (isset($data['default'])) {
+                if (!is_array($data['default']) || !is_array($data['default']['mappings'] ?? null)) {
+                    throw ConfigurationException::invalidMappingFile(
+                        $filePath,
+                        '"default" must contain a "mappings" list',
+                    );
+                }
+                $base = $this->parseMappingList($filePath, $data['default']['mappings'], 'default.mappings');
             }
 
-            $mappings[] = $this->parseFieldMapping($filePath, $index, $item);
+            $typeMappings = [];
+            if (isset($data['types'])) {
+                if (!is_array($data['types'])) {
+                    throw ConfigurationException::invalidMappingFile($filePath, '"types" must be a map of type => rules');
+                }
+                foreach ($data['types'] as $typeKey => $typeNode) {
+                    if (!is_array($typeNode) || !is_array($typeNode['mappings'] ?? null)) {
+                        throw ConfigurationException::invalidMappingFile(
+                            $filePath,
+                            sprintf('"types.%s" must contain a "mappings" list', (string) $typeKey),
+                        );
+                    }
+                    $typeMappings[(string) $typeKey] = $this->parseMappingList(
+                        $filePath,
+                        $typeNode['mappings'],
+                        sprintf('types.%s.mappings', (string) $typeKey),
+                    );
+                }
+            }
         }
 
         return new MappingCollection(
             entityType: $data['entity'],
             lookupField: $data['lookup_field'],
-            mappings: $mappings,
+            mappings: $base,
+            typeMappings: $typeMappings,
         );
+    }
+
+    /**
+     * @param mixed $list
+     * @return FieldMapping[]
+     */
+    private function parseMappingList(string $filePath, mixed $list, string $context): array
+    {
+        if (!is_array($list)) {
+            throw ConfigurationException::invalidMappingFile(
+                $filePath,
+                sprintf('"%s" must be a list', $context),
+            );
+        }
+
+        $mappings = [];
+        foreach ($list as $index => $item) {
+            if (!is_array($item)) {
+                throw ConfigurationException::invalidMappingFile(
+                    $filePath,
+                    sprintf('Mapping at %s[%d] must be an array', $context, $index),
+                );
+            }
+
+            $mappings[] = $this->parseFieldMapping($filePath, (int) $index, $item);
+        }
+
+        return $mappings;
     }
 
     /**
