@@ -20,6 +20,9 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
 {
     private const ACTIVITIES_MODEL = 'Activities';
 
+    /** @var array<string, string|null> user-login-by-email cache, keyed by lowercased email (per run) */
+    private array $userLoginCache = [];
+
     private readonly Client $client;
 
     public function __construct(
@@ -44,14 +47,14 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
 
     public function createContact(Contact $contact): Contact
     {
-        $data = $this->createEntity('Contacts', $contact->toArray());
+        $data = $this->createEntity('Contacts', $this->prepareContactData($contact->toArray()));
 
         return Contact::fromArray($data);
     }
 
     public function updateContact(string $id, Contact $contact): Contact
     {
-        $data = $this->updateEntity('Contacts', $id, $contact->toArray());
+        $data = $this->updateEntity('Contacts', $id, $this->prepareContactData($contact->toArray()));
 
         return Contact::fromArray($data);
     }
@@ -61,6 +64,17 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         $lookupValue = $contact->get($lookupField);
         if ($lookupValue === null) {
             throw AdapterException::missingId('contact');
+        }
+
+        // Resolve a mapped owner email (e.g. CRM owner -> Daktela user) to the
+        // user login up-front so hasChanges() compares login against login and
+        // unchanged contacts are skipped instead of re-updated every run.
+        $userValue = $contact->get('user');
+        if (is_string($userValue) && str_contains($userValue, '@')) {
+            $resolved = $this->findUserLoginByEmail($userValue);
+            if ($resolved !== null) {
+                $contact->set('user', $resolved);
+            }
         }
 
         $existing = $this->findContactBy([$lookupField => (string) $lookupValue]);
@@ -129,11 +143,120 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
     {
         /** @var Activity|null */
         return $this->findEntity(self::ACTIVITIES_MODEL, $id, function (array $data) use ($type): Activity {
-            $activity = Activity::fromArray($data);
+            $activity = Activity::fromArray($this->flattenActivityRow($data));
             $activity->setActivityType($type);
 
             return $activity;
         });
+    }
+
+    /**
+     * Prepare contact data for the write API. A `user` value that still looks
+     * like an email (mapped from a CRM owner but not resolvable to a Daktela
+     * user) is dropped rather than sent — the API would reject the whole
+     * contact for an unknown user reference, and we'd rather sync the contact
+     * without touching its owner.
+     *
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>
+     */
+    private function prepareContactData(array $data): array
+    {
+        $user = $data['user'] ?? null;
+        if (!is_string($user) || !str_contains($user, '@')) {
+            return $data;
+        }
+
+        $login = $this->findUserLoginByEmail($user);
+        if ($login !== null) {
+            $data['user'] = $login;
+
+            return $data;
+        }
+
+        $this->logger->warning('No Daktela user with email {email} — leaving contact owner untouched', [
+            'email' => $user,
+        ]);
+        unset($data['user']);
+
+        return $data;
+    }
+
+    /**
+     * Resolve a Daktela user login by email (notification email first, auth
+     * email as fallback). Cached per adapter instance (one sync run).
+     */
+    private function findUserLoginByEmail(string $email): ?string
+    {
+        $cacheKey = strtolower($email);
+        if (array_key_exists($cacheKey, $this->userLoginCache)) {
+            return $this->userLoginCache[$cacheKey];
+        }
+
+        $login = null;
+
+        foreach (['email', 'emailAuth'] as $field) {
+            $request = RequestFactory::buildReadRequest('Users');
+            $request->addFilter($field, 'eq', $email);
+            $request->setTake(1);
+
+            $response = $this->client->execute($request);
+            if ($response->hasErrors()) {
+                continue;
+            }
+
+            $data = $response->getData();
+            if (is_array($data) && $data !== []) {
+                $row = (array) $data[0];
+                $login = isset($row['name']) ? (string) $row['name'] : null;
+                if ($login !== null) {
+                    break;
+                }
+            }
+        }
+
+        return $this->userLoginCache[$cacheKey] = $login;
+    }
+
+    /**
+     * Flatten the nested relations of an Activities row so field mappings can
+     * address them as scalars:
+     *  - user    -> user_email / user_login / user_title
+     *  - contact -> contact_name
+     *  - item    -> item_<field> for every scalar field of the polymorphic
+     *               per-type record (item_direction, item_answered, ...).
+     *               `item` is type-specific (call, sms, email, ...), so the
+     *               available item_* fields differ per activity type.
+     *
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
+    private function flattenActivityRow(array $row): array
+    {
+        if (isset($row['user']) && (is_array($row['user']) || is_object($row['user']))) {
+            $user = (array) $row['user'];
+            // Prefer notification email, fall back to auth email
+            $email = !empty($user['email']) ? $user['email'] : null;
+            $emailAuth = !empty($user['emailAuth']) ? $user['emailAuth'] : null;
+            $row['user_email'] = $email ?? $emailAuth;
+            $row['user_login'] = $user['name'] ?? null;
+            $row['user_title'] = $user['title'] ?? null;
+        }
+
+        if (isset($row['contact']) && (is_array($row['contact']) || is_object($row['contact']))) {
+            $contact = (array) $row['contact'];
+            $row['contact_name'] = $contact['name'] ?? null;
+        }
+
+        if (isset($row['item']) && (is_array($row['item']) || is_object($row['item']))) {
+            foreach ((array) $row['item'] as $field => $value) {
+                if ($value === null || is_scalar($value)) {
+                    $row['item_' . $field] = $value;
+                }
+            }
+        }
+
+        return $row;
     }
 
     /** @return \Generator<int, Activity> */
@@ -168,23 +291,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
             foreach ($data as $item) {
                 $row = is_array($item) ? $item : (array) $item;
                 $row['id'] = $row['name'] ?? $row['id'] ?? null;
-
-                // Flatten nested user fields for mapping
-                if (isset($row['user']) && (is_array($row['user']) || is_object($row['user']))) {
-                    $user = (array) $row['user'];
-                    // Prefer notification email, fall back to auth email
-                    $email = !empty($user['email']) ? $user['email'] : null;
-                    $emailAuth = !empty($user['emailAuth']) ? $user['emailAuth'] : null;
-                    $row['user_email'] = $email ?? $emailAuth;
-                    $row['user_login'] = $user['name'] ?? null;
-                    $row['user_title'] = $user['title'] ?? null;
-                }
-
-                // Flatten nested contact reference for mapping
-                if (isset($row['contact']) && (is_array($row['contact']) || is_object($row['contact']))) {
-                    $contact = (array) $row['contact'];
-                    $row['contact_name'] = $contact['name'] ?? null;
-                }
+                $row = $this->flattenActivityRow($row);
 
                 $activity = Activity::fromArray($row);
                 $activity->setActivityType($type);
