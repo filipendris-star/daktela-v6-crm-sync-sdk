@@ -6,6 +6,7 @@ namespace Daktela\CrmSync\Sync;
 
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
+use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
@@ -229,14 +230,37 @@ final class BatchSync
         }
 
         $since = $this->resolveSince('activity');
+
+        // First run (no cursor): with initial_sync "now" (the default) we seed the
+        // cursor to the current time and push nothing — flooding the CRM with full
+        // CC history is almost never intended. Opt out with `initial_sync: everything`,
+        // or use forceFullSync for an explicit one-off historical push.
+        if ($since === null && !$this->forceFullSync && $this->stateStore !== null) {
+            $activityConfig = $this->config->getEntityConfig('activity');
+            if ($activityConfig === null || $activityConfig->initialSync === 'now') {
+                $seed = new \DateTimeImmutable();
+                $this->stateStore->setLastSyncTime('activity', $seed);
+                $this->logger->info('Activity sync has no cursor — seeding to now; historical activities are not pushed (initial_sync: now)', [
+                    'seeded' => $seed->format('c'),
+                ]);
+
+                $result = new SyncResult();
+                $result->setExhausted(true);
+                $result->finish();
+
+                return $result;
+            }
+        }
         $offset = $this->offsets['activity'] ?? 0;
         $result = new SyncResult();
         $count = 0;
         $exhausted = true;
 
         foreach ($activityTypes as $type) {
+            $typeMapping = $mapping->forType($type->value);
+
             foreach ($this->ccAdapter->iterateActivities($type, $since, $offset) as $activity) {
-                $record = $this->syncActivityToCrm($activity, $mapping);
+                $record = $this->syncActivityToCrm($activity, $typeMapping);
                 $result->addRecord($record);
                 $count++;
 
@@ -410,6 +434,11 @@ final class BatchSync
 
             if ($activity->getActivityType() !== null) {
                 $mappedActivity->setActivityType($activity->getActivityType());
+            }
+
+            $linkDeal = $this->config->getEntityConfig('activity')?->linkDeal;
+            if ($linkDeal !== null && $this->crmAdapter instanceof SupportsDealLinkingInterface) {
+                $mappedActivity = $this->crmAdapter->linkActivityToDeal($mappedActivity, $linkDeal);
             }
 
             $result = $this->crmAdapter->upsertActivity($mapping->lookupField, $mappedActivity);

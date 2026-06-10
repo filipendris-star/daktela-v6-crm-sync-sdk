@@ -100,12 +100,41 @@ final class YamlConfigLoader
 
                 $mappingFile = (string) ($config['mapping_file'] ?? '');
 
+                $activityTypeMap = [];
+                if (isset($config['activity_type_map']) && is_array($config['activity_type_map'])) {
+                    foreach ($config['activity_type_map'] as $ccType => $crmType) {
+                        if (ActivityType::tryFrom((string) $ccType) === null) {
+                            throw ConfigurationException::invalidMappingFile(
+                                $configPath,
+                                sprintf('activity_type_map: unknown CC activity type "%s"', (string) $ccType),
+                            );
+                        }
+                        $activityTypeMap[(string) $ccType] = (string) $crmType;
+                    }
+                }
+
+                $linkDeal = null;
+                if (isset($config['link_deal']) && (string) $config['link_deal'] !== '') {
+                    $linkDeal = (string) $config['link_deal'];
+                }
+
+                $initialSync = (string) ($config['initial_sync'] ?? 'now');
+                if (!in_array($initialSync, ['now', 'everything'], true)) {
+                    throw ConfigurationException::invalidMappingFile(
+                        $configPath,
+                        sprintf('initial_sync for entity "%s" must be "now" or "everything"', $type),
+                    );
+                }
+
                 $entities[(string) $type] = new EntitySyncConfig(
                     enabled: (bool) ($config['enabled'] ?? false),
                     direction: $direction,
                     mappingFile: $mappingFile,
                     activityTypes: $activityTypes,
                     autoCreateContact: $autoCreateContact,
+                    activityTypeMap: $activityTypeMap,
+                    linkDeal: $linkDeal,
+                    initialSync: $initialSync,
                 );
 
                 if ($mappingFile !== '') {
