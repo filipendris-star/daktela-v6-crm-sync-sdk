@@ -2,7 +2,7 @@
     "name": "daktela/daktela-v6-crm-sync",
     "description": "Universal sync layer between Daktela Contact Centre V6 and any CRM system",
     "type": "library",
-    "version": "1.0.5",
+    "version": "1.1.0",
     "license": "proprietary",
     "keywords": ["daktela", "crm", "sync", "contact-centre", "integration"],
     "authors": [
