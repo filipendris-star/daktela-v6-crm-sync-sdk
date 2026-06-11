@@ -94,6 +94,19 @@ final class YamlMappingLoader
     }
 
     /**
+     * Parse a list of field mapping rules that lives outside a mapping file
+     * (e.g. a custom entity's inline `write_back` rules in sync.yaml).
+     *
+     * @param string $origin used in error messages (config path or description)
+     * @param mixed $list
+     * @return FieldMapping[]
+     */
+    public function parseInlineRules(string $origin, mixed $list, string $context = 'rules'): array
+    {
+        return $this->parseMappingList($origin, $list, $context);
+    }
+
+    /**
      * @param mixed $list
      * @return FieldMapping[]
      */

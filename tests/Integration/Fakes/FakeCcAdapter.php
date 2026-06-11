@@ -150,6 +150,16 @@ final class FakeCcAdapter implements ContactCentreAdapterInterface
         yield from [];
     }
 
+    public function iterateEntity(
+        string $entityType,
+        ?\DateTimeImmutable $since = null,
+        int $offset = 0,
+        array $filters = [],
+        string $sinceField = 'edited',
+    ): \Generator {
+        yield from [];
+    }
+
     public function ping(): bool
     {
         return true;

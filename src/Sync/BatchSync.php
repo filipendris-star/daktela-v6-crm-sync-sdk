@@ -6,6 +6,7 @@ namespace Daktela\CrmSync\Sync;
 
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
+use Daktela\CrmSync\Adapter\SupportsCustomEntityWriteInterface;
 use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
@@ -14,6 +15,7 @@ use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Entity\Contact;
 use Daktela\CrmSync\Entity\EntityInterface;
+use Daktela\CrmSync\Entity\GenericEntity;
 use Daktela\CrmSync\Mapping\FieldMapper;
 use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\NestedValue;
@@ -292,14 +294,19 @@ final class BatchSync
     }
 
     /**
-     * Sync one batch of records from a configured custom entity into its target Daktela entity.
-     * Records flow source → target via the per-entry mapping; the target's existing upsert path
-     * is reused so relation maps and other downstream logic stay consistent.
+     * Sync one batch of records for a configured custom entity, in the entry's direction:
+     * crm_to_cc imports CRM records into a Daktela entity (the original behavior);
+     * cc_to_crm exports Daktela records into a CRM-side object (requires the CRM
+     * adapter to implement SupportsCustomEntityWriteInterface).
      */
     public function syncCustomEntity(
         \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
         MappingCollection $mapping,
     ): SyncResult {
+        if ($entry->direction === SyncDirection::CcToCrm) {
+            return $this->syncCustomEntityToCrm($entry, $mapping);
+        }
+
         $offsetKey = "custom:{$entry->name}";
         $since = $this->resolveSince($offsetKey);
         $offset = $this->offsets[$offsetKey] ?? 0;
@@ -350,6 +357,181 @@ final class BatchSync
         ]);
 
         return $result;
+    }
+
+    /**
+     * cc_to_crm custom entity export: enumerate a Daktela entity and upsert the
+     * records into a CRM-side object.
+     *
+     * Safety rails:
+     *  - first run with no cursor seeds it to now (initial_sync: "now", the default)
+     *    instead of exporting full history;
+     *  - the entry's export_filter is pushed into the CC query, so excluded records
+     *    (e.g. CRM-originated ones) never reach the CRM at all;
+     *  - upserts dedup via the CRM lookup (mapping lookup_field) before creating;
+     *  - after a create, the entry's write_back rules stamp the CRM identity onto
+     *    the CC source record so it is never exported again.
+     */
+    private function syncCustomEntityToCrm(
+        \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
+        MappingCollection $mapping,
+    ): SyncResult {
+        $offsetKey = "custom:{$entry->name}";
+        $result = new SyncResult();
+
+        if (!$this->crmAdapter instanceof SupportsCustomEntityWriteInterface) {
+            $this->logger->error(
+                'Custom entity "{name}" is cc_to_crm but the CRM adapter does not support custom entity writes — skipping',
+                ['name' => $entry->name],
+            );
+            $result->setExhausted(true);
+            $result->finish();
+
+            return $result;
+        }
+
+        $since = $this->resolveSince($offsetKey);
+
+        if ($since === null && !$this->forceFullSync && $this->stateStore !== null && $entry->initialSync === 'now') {
+            $seed = new \DateTimeImmutable();
+            $this->stateStore->setLastSyncTime($offsetKey, $seed);
+            $this->logger->info(
+                'Custom entity "{name}" export has no cursor — seeding to now; historical records are not pushed (initial_sync: now)',
+                ['name' => $entry->name, 'seeded' => $seed->format('c')],
+            );
+            $result->setExhausted(true);
+            $result->finish();
+
+            return $result;
+        }
+
+        $offset = $this->offsets[$offsetKey] ?? 0;
+        $count = 0;
+        $exhausted = true;
+
+        foreach ($this->ccAdapter->iterateEntity($entry->source, $since, $offset, $entry->exportFilter, $entry->sinceField) as $row) {
+            $result->addRecord($this->exportCustomRecordToCrm($entry, $mapping, $row));
+            $count++;
+
+            if ($count >= $this->config->batchSize) {
+                $exhausted = false;
+                break;
+            }
+        }
+
+        $result->setExhausted($exhausted);
+        $result->finish();
+
+        $this->offsets[$offsetKey] = $exhausted ? 0 : $offset + $count;
+
+        $this->logger->info('Batch custom entity {name} export completed (source: {source}, target: {target})', [
+            'name' => $entry->name,
+            'source' => $entry->source,
+            'target' => $entry->target,
+            'total' => $result->getTotalCount(),
+            'created' => $result->getCreatedCount(),
+            'updated' => $result->getUpdatedCount(),
+            'failed' => $result->getFailedCount(),
+            'incremental' => $since !== null,
+        ]);
+
+        return $result;
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private function exportCustomRecordToCrm(
+        \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
+        MappingCollection $mapping,
+        array $row,
+    ): RecordResult {
+        $sourceId = isset($row['id']) ? (string) $row['id'] : null;
+
+        try {
+            /** @var SupportsCustomEntityWriteInterface&CrmAdapterInterface $writer */
+            $writer = $this->crmAdapter;
+
+            $entity = new GenericEntity($sourceId, $row, $entry->source);
+            $mapped = $this->fieldMapper->map($entity, $mapping, SyncDirection::CcToCrm, $this->relationMaps);
+
+            $existing = null;
+            $lookupValue = $mapped[$mapping->lookupField] ?? null;
+            if (is_scalar($lookupValue) && (string) $lookupValue !== '') {
+                $existing = $writer->findCustomEntityByLookup($entry->target, $mapping->lookupField, (string) $lookupValue);
+            }
+
+            if ($existing !== null && isset($existing['id'])) {
+                $targetId = (string) $existing['id'];
+                $writer->updateCustomEntity($entry->target, $targetId, $mapped);
+                $status = SyncStatus::Updated;
+            } else {
+                $created = $writer->createCustomEntity($entry->target, $mapped);
+                $targetId = isset($created['id']) ? (string) $created['id'] : null;
+                $status = SyncStatus::Created;
+
+                if ($entry->writeBack !== [] && $sourceId !== null && $targetId !== null) {
+                    $this->applyExportWriteBack($entry, $sourceId, $created);
+                }
+            }
+
+            return new RecordResult(
+                entityType: "custom:{$entry->name}",
+                sourceId: $sourceId,
+                targetId: $targetId,
+                status: $status,
+            );
+        } catch (\Throwable $e) {
+            $this->logger->error('Failed to export {name} record {id}: {error}', [
+                'name' => $entry->name,
+                'id' => $sourceId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return new RecordResult(
+                entityType: "custom:{$entry->name}",
+                sourceId: $sourceId,
+                targetId: null,
+                status: SyncStatus::Failed,
+                errorMessage: $e->getMessage(),
+            );
+        }
+    }
+
+    /**
+     * Apply the entry's write_back rules: map fields of the freshly created CRM
+     * record (CRM→CC) and write them onto the CC source record — typically the
+     * CRM id wrapped in the import convention's prefix, so the record joins the
+     * regular import flow and the export filter excludes it from now on.
+     *
+     * @param array<string, mixed> $crmRecord
+     */
+    private function applyExportWriteBack(
+        \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
+        string $sourceId,
+        array $crmRecord,
+    ): void {
+        $writeBackMapping = new MappingCollection($entry->source, 'id', $entry->writeBack);
+        $crmEntity = new GenericEntity(
+            isset($crmRecord['id']) ? (string) $crmRecord['id'] : null,
+            $crmRecord,
+            $entry->target,
+        );
+
+        $mapped = $this->fieldMapper->map($crmEntity, $writeBackMapping, SyncDirection::CrmToCc, $this->relationMaps);
+        if ($mapped === []) {
+            return;
+        }
+
+        match ($entry->source) {
+            \Daktela\CrmSync\Config\CustomEntitySyncConfig::TARGET_CONTACT
+                => $this->ccAdapter->updateContact($sourceId, Contact::fromArray($mapped)),
+            \Daktela\CrmSync\Config\CustomEntitySyncConfig::TARGET_ACCOUNT
+                => $this->ccAdapter->updateAccount($sourceId, \Daktela\CrmSync\Entity\Account::fromArray($mapped)),
+            default => $this->logger->warning('write_back not supported for source "{source}"', [
+                'source' => $entry->source,
+            ]),
+        };
     }
 
     /**

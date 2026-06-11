@@ -190,6 +190,40 @@ final class YamlConfigLoader
 
                 $mappingFile = (string) ($entry['mapping_file'] ?? '');
 
+                $initialSync = (string) ($entry['initial_sync'] ?? 'now');
+                if (!in_array($initialSync, ['now', 'everything'], true)) {
+                    throw ConfigurationException::invalidMappingFile(
+                        $configPath,
+                        sprintf('initial_sync for custom entity "%s" must be "now" or "everything"', $name),
+                    );
+                }
+
+                $exportFilter = [];
+                if (isset($entry['export_filter']) && is_array($entry['export_filter'])) {
+                    foreach ($entry['export_filter'] as $filter) {
+                        if (!is_array($filter) || !isset($filter['field'])) {
+                            throw ConfigurationException::invalidMappingFile(
+                                $configPath,
+                                sprintf('export_filter entries for custom entity "%s" need field/operator/value', $name),
+                            );
+                        }
+                        $exportFilter[] = [
+                            'field' => (string) $filter['field'],
+                            'operator' => (string) ($filter['operator'] ?? 'eq'),
+                            'value' => $filter['value'] ?? '',
+                        ];
+                    }
+                }
+
+                $writeBack = [];
+                if (isset($entry['write_back']) && is_array($entry['write_back'])) {
+                    $writeBack = $this->mappingLoader->parseInlineRules(
+                        $configPath,
+                        $entry['write_back'],
+                        sprintf('custom_entities[%s].write_back', $name),
+                    );
+                }
+
                 $customEntities[] = new CustomEntitySyncConfig(
                     name: $name,
                     enabled: (bool) ($entry['enabled'] ?? false),
@@ -197,6 +231,10 @@ final class YamlConfigLoader
                     source: $source,
                     target: $target,
                     mappingFile: $mappingFile,
+                    initialSync: $initialSync,
+                    sinceField: (string) ($entry['since_field'] ?? 'edited'),
+                    exportFilter: $exportFilter,
+                    writeBack: $writeBack,
                 );
 
                 if ($mappingFile !== '') {

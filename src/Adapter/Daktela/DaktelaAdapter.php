@@ -150,6 +150,67 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         });
     }
 
+    /** @inheritDoc */
+    public function iterateEntity(
+        string $entityType,
+        ?\DateTimeImmutable $since = null,
+        int $offset = 0,
+        array $filters = [],
+        string $sinceField = 'edited',
+    ): \Generator {
+        $model = match ($entityType) {
+            'contact' => 'Contacts',
+            'account' => 'Accounts',
+            default => throw new \InvalidArgumentException(sprintf(
+                'iterateEntity supports "contact" and "account", got "%s"',
+                $entityType,
+            )),
+        };
+
+        $request = RequestFactory::buildReadRequest($model);
+
+        if ($since !== null) {
+            $request->addFilter($sinceField, 'gte', $since->format('Y-m-d H:i:s'));
+        }
+
+        foreach ($filters as $filter) {
+            $request->addFilter((string) $filter['field'], (string) $filter['operator'], $filter['value']);
+        }
+
+        $pageSize = 100;
+        $currentOffset = $offset;
+
+        while (true) {
+            $pageRequest = clone $request;
+            $pageRequest->setSkip($currentOffset);
+            $pageRequest->setTake($pageSize);
+
+            $response = $this->client->execute($pageRequest);
+
+            if ($response->hasErrors() || $response->isEmpty()) {
+                return;
+            }
+
+            $data = $response->getData();
+            if (!is_array($data) || $data === []) {
+                return;
+            }
+
+            foreach ($data as $item) {
+                $row = is_array($item) ? $item : (array) $item;
+                $row['id'] = $row['name'] ?? $row['id'] ?? null;
+
+                yield $row;
+            }
+
+            if (count($data) < $pageSize) {
+                return;
+            }
+
+            $currentOffset += $pageSize;
+        }
+    }
+
     /**
      * Prepare contact data for the write API. A `user` value that still looks
      * like an email (mapped from a CRM owner but not resolvable to a Daktela
