@@ -6,6 +6,7 @@ namespace Daktela\CrmSync\Sync;
 
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
+use Daktela\CrmSync\Adapter\SupportsCursorPaginationInterface;
 use Daktela\CrmSync\Adapter\SupportsCustomEntityWriteInterface;
 use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
@@ -35,8 +36,11 @@ final class BatchSync
     /** @var array<string, true> Keys are "entityType:crmId" */
     private array $syncingEntities = [];
 
-    /** @var array<string, int> Tracks pagination offset per entity type */
+    /** @var array<string, int> Tracks pagination offset per entity type (offset adapters) */
     private array $offsets = [];
+
+    /** @var array<string, string|null> In-run resume cursor per key (cursor adapters) */
+    private array $cursors = [];
 
     private bool $forceFullSync = false;
 
@@ -58,6 +62,35 @@ final class BatchSync
     public function resetOffsets(): void
     {
         $this->offsets = [];
+        $this->cursors = [];
+    }
+
+    /**
+     * Resolve the resume cursor for a cursor-paginated entity: in-run cursor first
+     * (continues a drain across the engine's batch loop), else the persisted one
+     * (resumes a drain that a previous run left unfinished).
+     */
+    private function resolveCursor(string $key): ?string
+    {
+        return $this->cursors[$key] ?? $this->stateStore?->getCursor($key);
+    }
+
+    /**
+     * Record the page outcome: a short page (rows < limit) or a null next token
+     * means the drain is complete — mark exhausted and clear the cursor so the
+     * next run starts fresh. Otherwise persist the next token (in-run + on disk)
+     * so an interrupted drain resumes instead of restarting.
+     *
+     * @param CursorPage<mixed> $page
+     */
+    private function advanceCursor(string $key, CursorPage $page, int $rows, int $limit, SyncResult $result): void
+    {
+        $exhausted = $rows < $limit || $page->nextCursor === null;
+        $next = $exhausted ? null : $page->nextCursor;
+
+        $result->setExhausted($exhausted);
+        $this->cursors[$key] = $next;
+        $this->stateStore?->setCursor($key, $next);
     }
 
     /**
@@ -101,36 +134,37 @@ final class BatchSync
         }
 
         $since = $this->resolveSince('contact');
-        $offset = $this->offsets['contact'] ?? 0;
         $result = new SyncResult();
-        $count = 0;
-        $exhausted = true;
+        $upsertFn = $this->buildUpsertFn('contact');
 
-        foreach ($this->crmAdapter->iterateContacts($since, $offset) as $contact) {
-            $record = $this->syncEntityToCc(
-                entity: $contact,
-                mapping: $mapping,
-                entityType: 'contact',
-                upsertFn: $this->buildUpsertFn('contact'),
-            );
-
-            $result->addRecord($record);
-            $count++;
-
-            if ($count >= $this->config->batchSize) {
-                $exhausted = false;
-                break;
+        if ($this->crmAdapter instanceof SupportsCursorPaginationInterface) {
+            $limit = $this->config->batchSize;
+            $cursor = $this->resolveCursor('contact');
+            $page = $this->crmAdapter->fetchContactsPage($since, $cursor, $limit);
+            foreach ($page->records as $contact) {
+                $result->addRecord($this->syncEntityToCc($contact, $mapping, 'contact', $upsertFn));
             }
-        }
-
-        $result->setExhausted($exhausted);
-        $result->finish();
-
-        if ($exhausted) {
-            $this->offsets['contact'] = 0;
+            $this->advanceCursor('contact', $page, count($page->records), $limit, $result);
         } else {
-            $this->offsets['contact'] = $offset + $count;
+            $offset = $this->offsets['contact'] ?? 0;
+            $count = 0;
+            $exhausted = true;
+
+            foreach ($this->crmAdapter->iterateContacts($since, $offset) as $contact) {
+                $result->addRecord($this->syncEntityToCc($contact, $mapping, 'contact', $upsertFn));
+                $count++;
+
+                if ($count >= $this->config->batchSize) {
+                    $exhausted = false;
+                    break;
+                }
+            }
+
+            $result->setExhausted($exhausted);
+            $this->offsets['contact'] = $exhausted ? 0 : $offset + $count;
         }
+
+        $result->finish();
 
         $this->logger->info('Batch contact sync completed', [
             'total' => $result->getTotalCount(),
@@ -152,20 +186,12 @@ final class BatchSync
         }
 
         $since = $this->resolveSince('account');
-        $offset = $this->offsets['account'] ?? 0;
         $result = new SyncResult();
         $autoContactResult = new SyncResult();
-        $count = 0;
-        $exhausted = true;
+        $upsertFn = $this->buildUpsertFn('account');
 
-        foreach ($this->crmAdapter->iterateAccounts($since, $offset) as $account) {
-            $record = $this->syncEntityToCc(
-                entity: $account,
-                mapping: $mapping,
-                entityType: 'account',
-                upsertFn: $this->buildUpsertFn('account'),
-            );
-
+        $processAccount = function (EntityInterface $account) use ($mapping, $upsertFn, $result, $autoContactResult): void {
+            $record = $this->syncEntityToCc($account, $mapping, 'account', $upsertFn);
             $result->addRecord($record);
 
             if ($record->status !== SyncStatus::Failed) {
@@ -174,25 +200,37 @@ final class BatchSync
                     $autoContactResult->addRecord($autoRecord);
                 }
             }
+        };
 
-            $count++;
-
-            if ($count >= $this->config->batchSize) {
-                $exhausted = false;
-                break;
+        if ($this->crmAdapter instanceof SupportsCursorPaginationInterface) {
+            $limit = $this->config->batchSize;
+            $page = $this->crmAdapter->fetchAccountsPage($since, $this->resolveCursor('account'), $limit);
+            foreach ($page->records as $account) {
+                $processAccount($account);
             }
-        }
-
-        $result->setExhausted($exhausted);
-        $result->finish();
-        $autoContactResult->setExhausted($exhausted);
-        $autoContactResult->finish();
-
-        if ($exhausted) {
-            $this->offsets['account'] = 0;
+            $this->advanceCursor('account', $page, count($page->records), $limit, $result);
         } else {
-            $this->offsets['account'] = $offset + $count;
+            $offset = $this->offsets['account'] ?? 0;
+            $count = 0;
+            $exhausted = true;
+
+            foreach ($this->crmAdapter->iterateAccounts($since, $offset) as $account) {
+                $processAccount($account);
+                $count++;
+
+                if ($count >= $this->config->batchSize) {
+                    $exhausted = false;
+                    break;
+                }
+            }
+
+            $result->setExhausted($exhausted);
+            $this->offsets['account'] = $exhausted ? 0 : $offset + $count;
         }
+
+        $result->finish();
+        $autoContactResult->setExhausted($result->isExhausted());
+        $autoContactResult->finish();
 
         $this->logger->info('Batch account sync completed', [
             'total' => $result->getTotalCount(),

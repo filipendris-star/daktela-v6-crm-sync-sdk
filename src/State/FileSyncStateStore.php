@@ -20,6 +20,10 @@ final class FileSyncStateStore implements SyncStateStoreInterface
             return null;
         }
 
+        if (!is_string($data[$entityType])) {
+            return null;
+        }
+
         $time = \DateTimeImmutable::createFromFormat(\DateTimeInterface::ATOM, $data[$entityType]);
 
         return $time !== false ? $time : null;
@@ -32,10 +36,35 @@ final class FileSyncStateStore implements SyncStateStoreInterface
         $this->writeData($data);
     }
 
+    public function getCursor(string $key): ?string
+    {
+        $data = $this->readData();
+        $cursor = $data['__cursors'][$key] ?? null;
+
+        return is_string($cursor) && $cursor !== '' ? $cursor : null;
+    }
+
+    public function setCursor(string $key, ?string $cursor): void
+    {
+        $data = $this->readData();
+        if ($cursor === null || $cursor === '') {
+            unset($data['__cursors'][$key]);
+            if (($data['__cursors'] ?? null) === []) {
+                unset($data['__cursors']);
+            }
+        } else {
+            $cursors = is_array($data['__cursors'] ?? null) ? $data['__cursors'] : [];
+            $cursors[$key] = $cursor;
+            $data['__cursors'] = $cursors;
+        }
+        $this->writeData($data);
+    }
+
     public function clear(string $entityType): void
     {
         $data = $this->readData();
         unset($data[$entityType]);
+        unset($data['__cursors'][$entityType]);
         $this->writeData($data);
     }
 
@@ -45,7 +74,7 @@ final class FileSyncStateStore implements SyncStateStoreInterface
     }
 
     /**
-     * @return array<string, string>
+     * @return array<string, mixed>
      */
     private function readData(): array
     {
@@ -64,7 +93,7 @@ final class FileSyncStateStore implements SyncStateStoreInterface
     }
 
     /**
-     * @param array<string, string> $data
+     * @param array<string, mixed> $data
      */
     private function writeData(array $data): void
     {
