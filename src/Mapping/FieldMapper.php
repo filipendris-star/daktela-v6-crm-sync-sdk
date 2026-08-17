@@ -53,9 +53,12 @@ final class FieldMapper
             }
             $value = $this->applyTransformers($value, $mapping->transformers);
 
-            // Apply relation resolution if configured
-            if ($mapping->relation !== null && is_string($value) && $value !== '') {
-                $value = $this->resolveRelation($value, $mapping->relation, $relationMaps);
+            // Apply relation resolution if configured. Accept int FKs too:
+            // numeric-id CRMs (Pipedrive, HubSpot, …) hand back integer foreign
+            // keys, and the old is_string() guard silently skipped resolution for
+            // them, writing the raw CRM id instead of the resolved Daktela name.
+            if ($mapping->relation !== null && (is_string($value) || is_int($value)) && $value !== '') {
+                $value = $this->resolveRelation((string) $value, $mapping->relation, $relationMaps);
             }
 
             if ($mapping->append) {

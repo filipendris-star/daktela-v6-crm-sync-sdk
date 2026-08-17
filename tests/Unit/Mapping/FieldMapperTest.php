@@ -144,6 +144,31 @@ final class FieldMapperTest extends TestCase
         self::assertSame('acme', $result['account']);
     }
 
+    public function testRelationResolutionForIntegerForeignKey(): void
+    {
+        // Numeric-id CRMs (Pipedrive, HubSpot, …) hand back integer foreign keys;
+        // the resolver must still consult the relation map (whose keys are strings)
+        // rather than writing the raw int. Regression guard for the is_string()
+        // short-circuit that broke Pipedrive contact→account links.
+        $collection = new MappingCollection('contact', 'email', [
+            new FieldMapping(
+                ccField: 'account',
+                crmField: 'org_id',
+                relation: new RelationConfig('account', 'id', 'name'),
+            ),
+        ]);
+
+        $entity = Contact::fromArray(['org_id' => 6]);
+
+        $relationMaps = [
+            'account' => ['6' => 'pipedrive_6'],
+        ];
+
+        $result = $this->mapper->map($entity, $collection, SyncDirection::CrmToCc, $relationMaps);
+
+        self::assertSame('pipedrive_6', $result['account']);
+    }
+
     public function testRelationResolutionFallsBackToOriginalValue(): void
     {
         $collection = new MappingCollection('contact', 'email', [
