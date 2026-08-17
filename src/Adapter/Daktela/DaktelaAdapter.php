@@ -325,9 +325,15 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
     {
         $request = RequestFactory::buildReadRequest(self::ACTIVITIES_MODEL);
         $request->addFilter('type', 'eq', strtoupper($type->value));
+        // Only closed activities sync outward: they are terminal (so no later update
+        // is needed) and `time_close` is their change/eligibility marker — activities
+        // have no `edited`. The incremental cursor must therefore key on `time_close`,
+        // not `time`; using `time` (the activity's start) silently drops activities
+        // that started before the watermark but closed after it.
+        $request->addFilter('action', 'eq', 'CLOSE');
 
         if ($since !== null) {
-            $request->addFilter('time', 'gte', $since->format('Y-m-d H:i:s'));
+            $request->addFilter('time_close', 'gte', $since->format('Y-m-d H:i:s'));
         }
 
         $pageSize = 100;
