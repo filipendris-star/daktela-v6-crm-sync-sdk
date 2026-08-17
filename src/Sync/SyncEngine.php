@@ -10,6 +10,7 @@ use Daktela\CrmSync\Config\SyncConfiguration;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Mapping\FieldMapper;
 use Daktela\CrmSync\Mapping\Transformer\TransformerRegistry;
+use Daktela\CrmSync\State\SyncLedgerInterface;
 use Daktela\CrmSync\State\SyncStateStoreInterface;
 use Daktela\CrmSync\Sync\Result\AccountSyncResult;
 use Daktela\CrmSync\Sync\Result\FullSyncResult;
@@ -49,6 +50,16 @@ final class SyncEngine
             $this->config,
             $this->logger,
         );
+    }
+
+    /**
+     * Inject a host-supplied idempotency ledger (e.g. a DB-backed store) used to
+     * dedupe one-way exports the CRM cannot search server-side (activities).
+     * When unset, exports fall back to the adapter's own upsert/lookup.
+     */
+    public function setLedger(?SyncLedgerInterface $ledger): void
+    {
+        $this->batchSync->setLedger($ledger);
     }
 
     /**

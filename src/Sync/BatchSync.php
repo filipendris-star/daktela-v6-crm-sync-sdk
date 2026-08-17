@@ -21,6 +21,7 @@ use Daktela\CrmSync\Mapping\FieldMapper;
 use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\NestedValue;
 use Daktela\CrmSync\Mapping\RelationConfig;
+use Daktela\CrmSync\State\SyncLedgerInterface;
 use Daktela\CrmSync\State\SyncStateStoreInterface;
 use Daktela\CrmSync\Sync\Result\AccountSyncResult;
 use Daktela\CrmSync\Sync\Result\RecordResult;
@@ -44,6 +45,8 @@ final class BatchSync
 
     private bool $forceFullSync = false;
 
+    private ?SyncLedgerInterface $ledger = null;
+
     public function __construct(
         private readonly ContactCentreAdapterInterface $ccAdapter,
         private readonly CrmAdapterInterface $crmAdapter,
@@ -57,6 +60,11 @@ final class BatchSync
     public function setForceFullSync(bool $force): void
     {
         $this->forceFullSync = $force;
+    }
+
+    public function setLedger(?SyncLedgerInterface $ledger): void
+    {
+        $this->ledger = $ledger;
     }
 
     public function resetOffsets(): void
@@ -300,8 +308,22 @@ final class BatchSync
             $typeMapping = $mapping->forType($type->value);
 
             foreach ($this->ccAdapter->iterateActivities($type, $since, $offset) as $activity) {
-                $record = $this->syncActivityToCrm($activity, $typeMapping);
-                $result->addRecord($record);
+                $ccId = (string) $activity->getId();
+
+                // Idempotency ledger: skip activities already exported (the CRM
+                // can't dedupe activities server-side) and record the rest once
+                // created. syncActivityToCrm() creates without a CRM-side lookup
+                // when a ledger is set, since the ledger already owns dedup.
+                if ($this->ledger !== null && $ccId !== '' && $this->ledger->hasSynced('activity', $ccId)) {
+                    $result->addRecord(new RecordResult('activity', $ccId, null, SyncStatus::Skipped));
+                } else {
+                    $record = $this->syncActivityToCrm($activity, $typeMapping);
+                    $result->addRecord($record);
+
+                    if ($this->ledger !== null && $ccId !== '' && $record->status !== SyncStatus::Failed) {
+                        $this->ledger->recordSynced('activity', $ccId, $record->targetId);
+                    }
+                }
                 $count++;
 
                 if ($count >= $this->config->batchSize) {
@@ -659,6 +681,20 @@ final class BatchSync
             $linkDeal = $this->config->getEntityConfig('activity')?->linkDeal;
             if ($linkDeal !== null && $this->crmAdapter instanceof SupportsDealLinkingInterface) {
                 $mappedActivity = $this->crmAdapter->linkActivityToDeal($mappedActivity, $linkDeal);
+            }
+
+            // With a ledger the existence check already happened (this record is
+            // new), so create directly — no CRM-side lookup. Without one, fall
+            // back to the adapter's upsert (find-then-create/update).
+            if ($this->ledger !== null) {
+                $result = $this->crmAdapter->createActivity($mappedActivity);
+
+                return new RecordResult(
+                    entityType: 'activity',
+                    sourceId: $activity->getId(),
+                    targetId: $result->getId(),
+                    status: SyncStatus::Created,
+                );
             }
 
             $result = $this->crmAdapter->upsertActivity($mapping->lookupField, $mappedActivity);
