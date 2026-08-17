@@ -35,8 +35,10 @@ final class YamlMappingLoader
             throw ConfigurationException::invalidMappingFile($filePath, 'Missing or invalid "lookup_field" key');
         }
 
-        $hasLegacy = isset($data['mappings']);
-        $hasStructured = isset($data['default']) || isset($data['types']);
+        // An empty top-level `mappings` ({} / []) is treated as absent — the UI emits
+        // an empty `mappings:` key alongside default/types, which must not conflict.
+        $hasLegacy = !empty($data['mappings']);
+        $hasStructured = !empty($data['default']) || !empty($data['types']);
 
         if ($hasLegacy && $hasStructured) {
             throw ConfigurationException::invalidMappingFile(
