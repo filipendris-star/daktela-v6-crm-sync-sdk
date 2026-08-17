@@ -317,6 +317,23 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
             }
         }
 
+        // Derive a single call-state token from direction + answered so field
+        // mappings can drive Pipedrive `done`/`subject`/`type` with one value_map.
+        // The mapping engine reads one source field per rule and transformers see
+        // only that scalar, so a state that depends on *two* item fields
+        // (direction × answered) is not expressible from the raw fields alone.
+        // An unanswered inbound call is a missed call regardless of the
+        // `missed_call` flag, so direction + answered fully determine the state.
+        if (isset($row['item_direction']) && array_key_exists('item_answered', $row)) {
+            $direction = (string) $row['item_direction'];
+            $answered = !empty($row['item_answered']);
+            $row['item_call_state'] = match ($direction) {
+                'in' => $answered ? 'in_answered' : 'in_missed',
+                'out' => $answered ? 'out_answered' : 'out_noanswer',
+                default => $answered ? 'internal_answered' : 'internal_noanswer',
+            };
+        }
+
         return $row;
     }
 
