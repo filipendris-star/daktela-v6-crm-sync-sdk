@@ -138,12 +138,6 @@ final class WebhookSync
         }
 
         try {
-            if ($this->ledger !== null && $id !== '' && $this->ledger->hasSynced('activity', $id)) {
-                $result->addRecord(new RecordResult('activity', $id, null, SyncStatus::Skipped));
-                $result->finish();
-                return $result;
-            }
-
             $activity = $this->ccAdapter->findActivity($id, $type);
             if ($activity === null) {
                 $result->addRecord(new RecordResult('activity', $id, null, SyncStatus::Skipped));
@@ -174,6 +168,9 @@ final class WebhookSync
 
             // Record in the ledger so a later batch run (create-without-lookup
             // when a ledger is set) skips this activity instead of duplicating it.
+            // The webhook path itself never skips on the ledger: an activity emits
+            // several events (call_create → call_answer → call_close), and each one
+            // must be able to update the CRM record the first event created.
             if ($this->ledger !== null && $id !== '') {
                 $this->ledger->recordSynced('activity', $id, $synced->getId());
             }

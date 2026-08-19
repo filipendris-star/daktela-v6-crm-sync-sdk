@@ -107,16 +107,26 @@ final class WebhookSyncTest extends TestCase
     }
 
 
-    public function testSyncActivitySkipsWhenLedgerKnowsIt(): void
+    public function testSyncActivityStillUpdatesWhenTheLedgerAlreadyKnowsIt(): void
     {
+        // One activity emits several webhook events (call_create → call_answer →
+        // call_close). If the ledger made the webhook path skip, the CRM record
+        // would freeze at the first event's payload (no duration, no recording)
+        // and the batch path would skip it too — permanently wrong. The ledger is
+        // for recording here, not for skipping.
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
-        $ccAdapter->expects(self::never())->method('findActivity');
+        $ccAdapter->method('findActivity')->willReturn(Activity::fromArray([
+            'id' => 'call-1', 'activity_type' => 'call', 'name' => 'call-1', 'title' => 'Call closed',
+        ]));
 
         $crmAdapter = $this->createMock(CrmAdapterInterface::class);
-        $crmAdapter->expects(self::never())->method('upsertActivity');
+        $crmAdapter->expects(self::once())
+            ->method('upsertActivity')
+            ->willReturn(Activity::fromArray(['id' => 'crm-act-1']));
 
         $ledger = $this->createMock(\Daktela\CrmSync\State\SyncLedgerInterface::class);
-        $ledger->method('hasSynced')->with('activity', 'call-1')->willReturn(true);
+        $ledger->method('hasSynced')->willReturn(true);
+        $ledger->expects(self::once())->method('recordSynced');
 
         $webhookSync = new WebhookSync(
             $ccAdapter,
@@ -129,7 +139,7 @@ final class WebhookSyncTest extends TestCase
 
         $result = $webhookSync->syncActivity('call-1', ActivityType::Call);
 
-        self::assertSame(SyncStatus::Skipped, $result->getRecords()[0]->status);
+        self::assertSame(SyncStatus::Updated, $result->getRecords()[0]->status);
     }
 
     public function testSyncActivityRecordsInLedgerAfterUpsert(): void
