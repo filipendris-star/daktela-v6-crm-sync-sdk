@@ -49,6 +49,17 @@ final class BatchSync
     /** @var array<string, string|null> "offset:firstRowId" of the previous export batch per key (write-back spin guard) */
     private array $exportSpinGuard = [];
 
+    /** @var array<string, int> Consecutive record-less cursor pages in the current drain, per key */
+    private array $emptyCursorPages = [];
+
+    /**
+     * Upper bound on consecutive record-less pages within one drain. A filtered
+     * search may legitimately return many (every row on the page filtered out
+     * server-side), so this is deliberately generous — it exists only to stop a
+     * runaway adapter that keeps issuing fresh tokens without ever finishing.
+     */
+    private const MAX_EMPTY_CURSOR_PAGES = 1000;
+
 
     private bool $forceFullSync = false;
 
@@ -79,6 +90,8 @@ final class BatchSync
         $this->offsets = [];
         $this->cursors = [];
         $this->exportSpinGuard = [];
+        // Drain-scoped: SyncEngine calls resetOffsets() before each step's drain.
+        $this->emptyCursorPages = [];
     }
 
     /**
@@ -102,7 +115,7 @@ final class BatchSync
     }
 
     /**
-     * Record the page outcome: only a null next token (or an empty page) means the
+     * Record the page outcome: only a null next token means the
      * drain is complete — mark exhausted and clear the cursor so the next run
      * starts fresh. A short page is NOT treated as exhaustion: filtered searches
      * (e.g. HubSpot) legitimately return fewer rows than the limit while more
@@ -126,7 +139,28 @@ final class BatchSync
         // treating it as the end would clear the cursor and let the watermark
         // advance over everything behind that token.
         if ($page->nextCursor !== null && $page->nextCursor === $requestedCursor) {
+            $this->emptyCursorPages[$key] = 0;
+
             throw AdapterException::cursorPaginationStalled($key, $requestedCursor);
+        }
+
+        // A token that keeps advancing while never yielding a record is the other
+        // runaway shape (a `has_more` that is never false). Bounded per drain, and
+        // the counter is cleared when it trips so the next run gets a full attempt
+        // rather than being wedged at one page per run forever.
+        if ($rows === 0 && $page->nextCursor !== null) {
+            $seen = ($this->emptyCursorPages[$key] ?? 0) + 1;
+            $this->emptyCursorPages[$key] = $seen;
+
+            if ($seen >= self::MAX_EMPTY_CURSOR_PAGES) {
+                $this->emptyCursorPages[$key] = 0;
+                $this->cursors[$key] = $page->nextCursor;
+                $this->stateStore?->setCursor($key, $this->forceFullSync ? null : $page->nextCursor);
+
+                throw AdapterException::cursorDrainRunaway($key, $seen);
+            }
+        } else {
+            $this->emptyCursorPages[$key] = 0;
         }
 
         $exhausted = $page->nextCursor === null;

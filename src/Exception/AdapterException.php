@@ -15,12 +15,21 @@ class AdapterException extends SyncException
         );
     }
 
-    public static function cursorPaginationStalled(string $key, ?string $cursor): self
+    public static function cursorPaginationStalled(string $key, string $cursor): self
     {
         return new self(sprintf(
             'Cursor pagination for "%s" did not advance: the adapter returned the same next token it was given ("%s"). It must return a new token, or null when the drain is complete.',
             $key,
-            $cursor ?? 'null',
+            $cursor,
+        ));
+    }
+
+    public static function cursorDrainRunaway(string $key, int $emptyPages): self
+    {
+        return new self(sprintf(
+            'Cursor pagination for "%s" returned %d consecutive pages without a single record while still handing back a next token. The adapter must return nextCursor = null once the result set is exhausted.',
+            $key,
+            $emptyPages,
         ));
     }
 

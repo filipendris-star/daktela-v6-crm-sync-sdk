@@ -225,6 +225,60 @@ final class BatchSyncCursorPaginationTest extends TestCase
         self::assertNull($store->getCursor('contact'));
     }
 
+
+    public function testRunawayAdapterWithAdvancingTokensIsBoundedPerDrain(): void
+    {
+        // The other runaway shape: tokens keep advancing but no page ever yields a
+        // record and nextCursor is never null (a `has_more` that is never false).
+        // The same-token check cannot see this, so the drain needs an upper bound.
+        $store = new FileSyncStateStore($this->stateFile);
+        $adapter = new AlwaysEmptyAdvancingCursorAdapter();
+
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+
+        $threw = false;
+        try {
+            for ($i = 0; $i < 5000; $i++) {
+                $batch->syncContacts();
+            }
+        } catch (\Daktela\CrmSync\Exception\AdapterException) {
+            $threw = true;
+        }
+
+        self::assertTrue($threw, 'a drain that never yields a record must be bounded');
+        self::assertLessThan(2000, $adapter->calls, 'bounded well before 5000 requests');
+    }
+
+    public function testDrainIsNotWedgedAfterTheRunawayBoundTrips(): void
+    {
+        // The counter is drain-scoped and cleared when it trips, so the next run
+        // gets a full attempt instead of failing after a single page forever.
+        $store = new FileSyncStateStore($this->stateFile);
+        $adapter = new AlwaysEmptyAdvancingCursorAdapter();
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+
+        $firstRunCalls = $this->drainUntilAdapterException($batch, $adapter);
+        $secondRunCalls = $this->drainUntilAdapterException($batch, $adapter);
+
+        self::assertGreaterThan(100, $firstRunCalls, 'first run made real progress before failing');
+        self::assertGreaterThan(100, $secondRunCalls, 'the next run is not wedged at one page');
+    }
+
+    private function drainUntilAdapterException(BatchSync $batch, AlwaysEmptyAdvancingCursorAdapter $adapter): int
+    {
+        $before = $adapter->calls;
+
+        try {
+            for ($i = 0; $i < 5000; $i++) {
+                $batch->syncContacts();
+            }
+        } catch (\Daktela\CrmSync\Exception\AdapterException) {
+            // expected
+        }
+
+        return $adapter->calls - $before;
+    }
+
     private function batchSync(CrmAdapterInterface $crm, FileSyncStateStore $store, int $batchSize): BatchSync
     {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
@@ -247,5 +301,24 @@ final class BatchSyncCursorPaginationTest extends TestCase
     private function contact(string $name): Contact
     {
         return new Contact($name, ['name' => $name, 'title' => $name]);
+    }
+}
+
+/** Adapter whose pages always advance the token and never contain a record. */
+final class AlwaysEmptyAdvancingCursorAdapter extends FakeCursorCrmAdapter
+{
+    public int $calls = 0;
+
+    public function __construct()
+    {
+        parent::__construct([]);
+    }
+
+    public function fetchContactsPage(?\DateTimeImmutable $since, ?string $cursor, int $limit): CursorPage
+    {
+        $this->calls++;
+        $next = (int) ($cursor ?? '0') + $limit;
+
+        return new CursorPage([], (string) $next);
     }
 }

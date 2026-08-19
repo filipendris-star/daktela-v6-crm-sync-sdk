@@ -17,7 +17,7 @@ use Daktela\CrmSync\Sync\CursorPage;
  * returns a pre-seeded page keyed by the incoming cursor, and records which
  * cursors it was asked for.
  */
-final class FakeCursorCrmAdapter implements CrmAdapterInterface, SupportsCursorPaginationInterface
+class FakeCursorCrmAdapter implements CrmAdapterInterface, SupportsCursorPaginationInterface
 {
     /** @var array<int, string|null> */
     public array $cursorsSeen = [];
