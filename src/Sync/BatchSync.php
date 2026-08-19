@@ -544,14 +544,19 @@ final class BatchSync
         $result = new SyncResult();
 
         if (!$this->crmAdapter instanceof SupportsCustomEntityWriteInterface) {
+            // Must abort, not skip: a clean empty result lets saveState() advance
+            // the entity's watermark on every run, so once the adapter gains the
+            // capability, everything edited while it was missing sits outside the
+            // incremental window forever.
             $this->logger->error(
-                'Custom entity "{name}" is cc_to_crm but the CRM adapter does not support custom entity writes — skipping',
+                'Custom entity "{name}" is cc_to_crm but the CRM adapter does not support custom entity writes',
                 ['name' => $entry->name],
             );
-            $result->setExhausted(true);
-            $result->finish();
 
-            return $result;
+            throw NotSupportedException::operationNotSupported(
+                $this->crmAdapter::class,
+                sprintf('custom entity export for "%s" (SupportsCustomEntityWriteInterface)', $entry->name),
+            );
         }
 
         $since = $this->resolveSince($offsetKey);
