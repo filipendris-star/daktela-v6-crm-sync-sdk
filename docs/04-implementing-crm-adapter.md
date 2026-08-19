@@ -248,9 +248,9 @@ Required for `cc_to_crm` custom entity export (e.g. exporting CC-born
 contacts as CRM persons). Implement `createCustomEntity()` /
 `updateCustomEntity()`; both return the resulting CRM record as a flat array
 including its `id` so the engine can run identity write-back against the
-source record. Adapters without it should use the shared
-`UnsupportedCustomEntityTrait`, which throws a clear `NotSupportedException`
-per sync slot instead of silently no-op'ing.
+source record. Adapters that don't implement it need no stub: the engine
+feature-detects the interface and, for a `cc_to_crm` custom entity slot on a
+non-implementing adapter, logs an error and marks the slot exhausted.
 
 ### `SupportsDealLinkingInterface`
 

@@ -318,7 +318,12 @@ Behavior when a ledger is set:
 - an activity the ledger already knows is reported as `Skipped` — no CRM call;
 - new activities are **created directly** (no CRM-side lookup — the ledger owns dedup);
 - the pair is recorded after a successful create, with the resulting CRM id;
-- failed exports are *not* recorded, so the next run retries them.
+- failed exports are *not* recorded — they are retried if the sync window has
+  not advanced (e.g. a fully failed run holds the watermark);
+- a ledger **read** failure aborts the run (the watermark is kept, so the next
+  run retries cleanly); a ledger **write** failure after a successful create is
+  reported as a Failed record — the CRM record exists but dedup protection for
+  it is compromised.
 
 Without a ledger, activity export falls back to the adapter's
 `upsertActivity()` lookup-then-write path. Re-runs and forced full re-syncs

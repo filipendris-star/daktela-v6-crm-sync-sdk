@@ -77,7 +77,9 @@ final class YamlConfigLoaderTest extends TestCase
     {
         putenv('TEST_RAW_VALUE=resolved');
 
-        $tmpFile = tempnam(sys_get_temp_dir(), 'sync_') . '.yaml';
+        $base = tempnam(sys_get_temp_dir(), 'sync_');
+        $tmpFile = $base . '.yaml';
+        @unlink($base); // tempnam creates the extension-less file; don't leak it
         file_put_contents($tmpFile, implode("\n", [
             'daktela:',
             '  instance_url: "https://test.daktela.com"',
@@ -158,7 +160,9 @@ final class YamlConfigLoaderTest extends TestCase
         putenv('TEST_DAKTELA_TOKEN=env-token');
 
         // Create a temp config with env var
-        $tmpFile = tempnam(sys_get_temp_dir(), 'sync_') . '.yaml';
+        $base = tempnam(sys_get_temp_dir(), 'sync_');
+        $tmpFile = $base . '.yaml';
+        @unlink($base); // tempnam creates the extension-less file; don't leak it
         file_put_contents($tmpFile, "daktela:\n  instance_url: \"https://test.daktela.com\"\n  access_token: \"\${TEST_DAKTELA_TOKEN}\"\nsync:\n  batch_size: 10\n  entities: {}\nwebhook:\n  secret: \"\"");
 
         try {

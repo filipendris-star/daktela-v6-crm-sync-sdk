@@ -43,7 +43,7 @@ webhook:
 ### `sync`
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `batch_size` | int | 100 | Max records per batch sync run per entity type |
+| `batch_size` | int | 100 | Max records per batch sync run per entity type. For `cc_to_crm` custom-entity exports the effective batch is additionally capped at the adapter page size (100) — see the write_back pagination note under `sync.custom_entities[]` |
 
 ### `sync.entities.<type>`
 
@@ -55,7 +55,7 @@ Each entity type (`contact`, `account`, `activity`) can be configured independen
 | `direction` | string | `crm_to_cc`, `cc_to_crm`, or `bidirectional` |
 | `mapping_file` | string | Path to YAML mapping file (relative to config dir) |
 | `activity_types` | array | For activities only: which types to sync |
-| `activity_type_map` | map | For activities only: CC type → CRM activity type key (supports CRM-side custom types, e.g. `sms: sms`); validated here, applied by the CRM adapter |
+| `activity_type_map` | map | For activities only: CC type → CRM activity type key (supports CRM-side custom types, e.g. `sms: sms`). The SDK loader validates the CC type keys; the map itself is consumed by the adapter *factory* (e.g. `PipedriveSyncEngineFactory` reads it from the raw config and passes it to the adapter) — the SDK core does not read it |
 | `link_deal` | string | For activities only: deal-linking strategy (e.g. `latest_open`) — requires an adapter implementing `SupportsDealLinkingInterface` |
 | `initial_sync` | string | `now` (default) — first run seeds the cursor and skips history; `everything` — first run exports all historical records |
 | `auto_create_contact` | object | Auto-create a contact from account data (see [Sync Engine](05-sync-engine.md#auto-create-contact-from-account)) |
@@ -91,6 +91,13 @@ adapter implementing `SupportsCustomEntityWriteInterface`.
 | `initial_sync` | string | `now` (default) or `everything` |
 | `export_filter` | list | `{field, operator, value}` conditions selecting which CC records export |
 | `write_back` | list | Inline mapping rules applied CRM→CC after create (typically stamps the prefixed CRM id back, which removes the record from the export filter) |
+
+The write_back rules **must** rewrite a field the `export_filter` checks (the
+documented convention: rename the lookup field with the CRM-id prefix). The
+export pagination relies on successful write-backs removing records from the
+filtered set; a write_back that only touches unrelated fields is detected at
+runtime and logged as a warning, but records will be re-processed once before
+the engine advances past them.
 
 ```yaml
 sync:

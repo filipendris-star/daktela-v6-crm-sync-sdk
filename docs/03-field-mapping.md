@@ -6,7 +6,7 @@ Field mappings define how data is translated between Daktela CC fields and CRM f
 
 ```yaml
 entity: contact          # Entity type
-lookup_field: email      # Field used for upsert lookups
+lookup_field: email      # Field used for upsert lookups (see note below)
 mappings:
   - cc_field: title      # Daktela CC field name
     crm_field: full_name # CRM field name
@@ -65,6 +65,14 @@ scalar field of the type-specific item record (`item_direction`,
 (`out_answered`, `out_noanswer`, `in_answered`, `in_missed`,
 `internal_answered`, `internal_noanswer`) that a single `value_map` can turn
 into a CRM `done` flag or subject, which two separate fields cannot express.
+
+**`lookup_field` addresses different sides per direction.** On import
+(`crm_to_cc`) the upsert looks up the *CC-side* record, so `lookup_field`
+names a CC field. On export (`cc_to_crm`, incl. custom entities) the
+existence check runs against the *mapped CRM payload*, so it must name the
+CRM-side field your mapping writes (dotted paths into custom fields work).
+A mapping file copied from an import and flipped to export usually needs its
+`lookup_field` changed, or every run creates duplicates.
 
 ## Direction
 

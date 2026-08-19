@@ -103,7 +103,9 @@ final class YamlMappingLoaderTest extends TestCase
         // The UI can emit an empty `default:` next to populated `types:` — that
         // must load with no base rules, mirroring the top-level empty-`mappings:`
         // tolerance, not throw '"default" must contain a "mappings" list'.
-        $tmpFile = tempnam(sys_get_temp_dir(), 'mapping_') . '.yaml';
+        $base = tempnam(sys_get_temp_dir(), 'mapping_');
+        $tmpFile = $base . '.yaml';
+        @unlink($base); // tempnam creates the extension-less file; don't leak it
         file_put_contents($tmpFile, <<<YAML
             entity: activity
             lookup_field: externalId

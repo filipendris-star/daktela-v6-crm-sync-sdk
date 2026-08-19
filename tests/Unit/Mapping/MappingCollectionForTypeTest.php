@@ -20,7 +20,9 @@ final class MappingCollectionForTypeTest extends TestCase
 
     private function loadYaml(string $yaml): \Daktela\CrmSync\Mapping\MappingCollection
     {
-        $this->tmpFile = tempnam(sys_get_temp_dir(), 'mapping_') . '.yaml';
+        $base = tempnam(sys_get_temp_dir(), 'mapping_');
+        $this->tmpFile = $base . '.yaml';
+        @unlink($base); // tempnam creates the extension-less file; don't leak it
         file_put_contents($this->tmpFile, $yaml);
 
         return (new YamlMappingLoader())->load($this->tmpFile);
