@@ -12,11 +12,12 @@ use Daktela\CrmSync\Entity\Contact;
 interface ContactCentreAdapterInterface
 {
     /**
-     * Internal page size of the iterate* generators. BatchSync's export batch
-     * cap (EXPORT_BATCH_LIMIT) must never exceed this: consuming past one page
-     * while write-backs shrink the filtered set strands rows (the next page's
-     * skip is computed against the original set). Implementations must page by
-     * exactly this value.
+     * Internal page size of the iterate* generators. The export layer caps one
+     * batch at this value — consuming past one page while write-backs shrink the
+     * filtered set strands rows (the next page's skip is computed against the
+     * original set). Implementations paging by a different size MUST redeclare
+     * this constant to match: the export layer reads it from the adapter
+     * instance at runtime, so a redeclared value is honored.
      */
     public const ITERATE_PAGE_SIZE = 100;
 
@@ -59,7 +60,7 @@ interface ContactCentreAdapterInterface
      * implementation pages internally by a fixed page size, and its next-page
      * skip is computed against the ORIGINAL set — consuming past the first page
      * under mutation lands the skip past unread rows. The export layer therefore
-     * caps one batch at the page size (see BatchSync::EXPORT_BATCH_LIMIT).
+     * caps one batch at ITERATE_PAGE_SIZE (read from the adapter instance).
      *
      * @param array<int, array{field: string, operator: string, value: mixed}> $filters
      *        additional API-level filters (e.g. an export filter excluding

@@ -31,15 +31,6 @@ use Psr\Log\LoggerInterface;
 
 final class BatchSync
 {
-    /**
-     * Max rows consumed per custom-entity EXPORT batch. The CC adapter pages
-     * internally; consuming past its first page while write-backs shrink the
-     * filtered set makes the adapter's second-page skip land past unread rows —
-     * permanent loss once the window advances. Capping one batch at the adapter
-     * page size keeps all pagination under the departure-aware offset.
-     */
-    private const EXPORT_BATCH_LIMIT = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
-
     /** @var array<string, array<string, string>> */
     private array $relationMaps = [];
 
@@ -556,7 +547,13 @@ final class BatchSync
         $stillMatching = 0;
         $firstId = null;
         $exhausted = true;
-        $batchLimit = min($this->config->batchSize, self::EXPORT_BATCH_LIMIT);
+        // Cap one export batch at the CC adapter's page size (read from the
+        // instance so a redeclared constant is honored): the adapter pages
+        // internally, and consuming past its first page while write-backs shrink
+        // the filtered set makes the second page's skip land past unread rows —
+        // permanent loss once the window advances. The cap keeps all pagination
+        // under the departure-aware offset below.
+        $batchLimit = min($this->config->batchSize, $this->ccAdapter::ITERATE_PAGE_SIZE);
 
         foreach ($this->ccAdapter->iterateEntity($entry->source, $since, $offset, $entry->exportFilter, $entry->sinceField) as $row) {
             $firstId ??= isset($row['id']) ? (string) $row['id'] : '';
