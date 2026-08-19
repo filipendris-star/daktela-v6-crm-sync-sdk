@@ -350,9 +350,11 @@ final class DbLedger implements SyncLedgerLookupInterface
 }
 ```
 
-A ledger that does not implement it makes the webhook path **skip** follow-up
-events instead: one CRM record per activity (never a duplicate), but frozen at
-the first event's payload. A notice is logged naming the interface.
+Without it the webhook path falls back to the adapter's `upsertActivity()`, as it
+always has: on a CRM that *can* find the activity the follow-up events update it
+correctly, and on one that cannot they add another record — which is exactly the
+duplication `findCrmId()` removes. The SDK does not skip events to avoid that: a
+skip would freeze the record even on the CRMs where upsert works.
 
 ## Reset State
 

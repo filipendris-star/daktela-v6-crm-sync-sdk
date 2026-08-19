@@ -139,30 +139,11 @@ final class WebhookSync
         }
 
         try {
-            // A record the ledger already knows exists in the CRM, but the CRMs a
-            // ledger exists for cannot search activities — so the adapter's upsert
-            // would create a SECOND record for every follow-up event. Update it
-            // directly when the ledger can return the id; otherwise skip, which
-            // freezes the payload at the first event but never duplicates.
             $ledger = $this->ledger;
-            $knownCrmId = null;
             $alreadySynced = $ledger !== null && $id !== '' && $ledger->hasSynced('activity', $id);
-            if ($alreadySynced) {
-                if ($ledger instanceof SyncLedgerLookupInterface) {
-                    $knownCrmId = $ledger->findCrmId('activity', $id);
-                }
-
-                if ($knownCrmId === null) {
-                    $this->logger->notice(
-                        'Activity {id} already exported and the ledger cannot return its CRM id — skipping this event; implement SyncLedgerLookupInterface to let follow-up events update the record',
-                        ['id' => $id],
-                    );
-                    $result->addRecord(new RecordResult('activity', $id, null, SyncStatus::Skipped));
-                    $result->finish();
-
-                    return $result;
-                }
-            }
+            $knownCrmId = $alreadySynced && $ledger instanceof SyncLedgerLookupInterface
+                ? $ledger->findCrmId('activity', $id)
+                : null;
 
             $activity = $this->ccAdapter->findActivity($id, $type);
             if ($activity === null) {
@@ -190,15 +171,34 @@ final class WebhookSync
                 $mappedActivity = $this->crmAdapter->linkActivityToDeal($mappedActivity, $linkDeal);
             }
 
+            // One activity emits several events (call_create → call_answer →
+            // call_close); every event after the first must UPDATE the record the
+            // first one created. When the ledger can name that record we update it
+            // directly — otherwise we hand the decision to the adapter's upsert,
+            // exactly as this path always has. Deciding to skip here instead would
+            // freeze the record for every host whose ledger predates
+            // SyncLedgerLookupInterface, including on CRMs whose upsert finds and
+            // updates it perfectly well; and second-guessing the adapter's own
+            // lookup (which may key on anything) can only disagree with it.
+            //
+            // Known limit, unchanged by this SDK: on a CRM that cannot search
+            // activities, a plain ledger leaves upsert unable to locate the record,
+            // so follow-up events add another one. Implementing
+            // SyncLedgerLookupInterface is the fix.
             $synced = $knownCrmId !== null
-                ? $this->crmAdapter->updateActivity($knownCrmId, $mappedActivity)
+                ? $this->updateOrRecreate($knownCrmId, $typeMapping->lookupField, $mappedActivity)
                 : $this->crmAdapter->upsertActivity($typeMapping->lookupField, $mappedActivity);
 
             // Record in the ledger so a later batch run (create-without-lookup
             // when a ledger is set) skips this activity instead of duplicating it.
             // Only on first export: re-recording every follow-up event would break
             // ledgers whose store has a unique key on (entity_type, cc_id).
-            if ($ledger !== null && $id !== '' && !$alreadySynced) {
+            // First export always records. Afterwards, only re-record when we knew
+            // an id and it changed (the record was re-created after being deleted
+            // CRM-side) — never blindly, or a ledger whose store has a unique key
+            // on (entity_type, cc_id) would throw on the second event.
+            $recreated = $knownCrmId !== null && $synced->getId() !== $knownCrmId;
+            if ($ledger !== null && $id !== '' && (!$alreadySynced || $recreated)) {
                 $ledger->recordSynced('activity', $id, $synced->getId());
             }
 
@@ -213,6 +213,25 @@ final class WebhookSync
 
         $result->finish();
         return $result;
+    }
+
+    /**
+     * Update the recorded CRM record, falling back to the adapter's upsert when it
+     * no longer exists (deleted CRM-side) so the activity can be re-created
+     * instead of failing on every event from now on.
+     */
+    private function updateOrRecreate(string $crmId, string $lookupField, Activity $mappedActivity): Activity
+    {
+        try {
+            return $this->crmAdapter->updateActivity($crmId, $mappedActivity);
+        } catch (\Throwable $e) {
+            $this->logger->warning(
+                'Updating recorded CRM activity {crmId} failed ({error}) — re-creating it',
+                ['crmId' => $crmId, 'error' => $e->getMessage()],
+            );
+
+            return $this->crmAdapter->upsertActivity($lookupField, $mappedActivity);
+        }
     }
 
     private function autoCreateContactFromAccount(
