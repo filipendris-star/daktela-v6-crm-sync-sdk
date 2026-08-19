@@ -319,7 +319,6 @@ final class BatchSync
                 return $result;
             }
         }
-        $offset = $this->offsets['activity'] ?? 0;
         $result = new SyncResult();
         $count = 0;
         $exhausted = true;
@@ -327,23 +326,29 @@ final class BatchSync
         foreach ($activityTypes as $type) {
             $typeMapping = $mapping->forType($type->value);
 
-            foreach ($this->ccAdapter->iterateActivities($type, $since, $offset) as $activity) {
+            // Offsets are tracked PER TYPE: a single shared offset would be fed
+            // as the skip to every type's query, so whenever an earlier type
+            // contributed rows to the batch, the next batch would start each
+            // remaining type past rows it never read — silently losing them once
+            // the incremental window advances.
+            $offsetKey = 'activity:' . $type->value;
+            $typeOffset = $this->offsets[$offsetKey] ?? 0;
+
+            foreach ($this->ccAdapter->iterateActivities($type, $since, $typeOffset) as $activity) {
                 $ccId = (string) $activity->getId();
 
                 // Idempotency ledger: skip activities already exported (the CRM
                 // can't dedupe activities server-side) and record the rest once
                 // created. syncActivityToCrm() creates without a CRM-side lookup
                 // when a ledger is set, since the ledger already owns dedup.
-                if ($this->ledger !== null && $ccId !== '' && $this->ledger->hasSynced('activity', $ccId)) {
-                    $result->addRecord(new RecordResult('activity', $ccId, null, SyncStatus::Skipped));
+                if ($this->ledger !== null && $ccId !== '') {
+                    $record = $this->exportActivityViaLedger($activity, $typeMapping, $ccId);
                 } else {
                     $record = $this->syncActivityToCrm($activity, $typeMapping);
-                    $result->addRecord($record);
-
-                    if ($this->ledger !== null && $ccId !== '' && $record->status !== SyncStatus::Failed) {
-                        $this->ledger->recordSynced('activity', $ccId, $record->targetId);
-                    }
                 }
+                $result->addRecord($record);
+
+                $this->offsets[$offsetKey] = ++$typeOffset;
                 $count++;
 
                 if ($count >= $this->config->batchSize) {
@@ -357,9 +362,9 @@ final class BatchSync
         $result->finish();
 
         if ($exhausted) {
-            $this->offsets['activity'] = 0;
-        } else {
-            $this->offsets['activity'] = $offset + $count;
+            foreach ($activityTypes as $type) {
+                unset($this->offsets['activity:' . $type->value]);
+            }
         }
 
         $this->logger->info('Batch activity sync completed', [
@@ -371,6 +376,54 @@ final class BatchSync
         ]);
 
         return $result;
+    }
+
+    /**
+     * Ledger-guarded activity export.
+     *
+     * A ledger READ failure aborts the run: nothing external has happened yet,
+     * and failing just the record would let a mixed batch advance the watermark
+     * past an activity that was never created — permanent loss. Aborting keeps
+     * the watermark, so the next run retries cleanly (already-created activities
+     * are deduped by the ledger).
+     *
+     * A ledger WRITE failure after a successful CRM create is surfaced as a
+     * Failed record instead: the CRM record exists, so aborting buys nothing,
+     * but operators must see that dedup protection is compromised — if the
+     * watermark does not advance (e.g. an all-failed run), the unrecorded
+     * create will duplicate on retry.
+     */
+    private function exportActivityViaLedger(Activity $activity, MappingCollection $typeMapping, string $ccId): RecordResult
+    {
+        assert($this->ledger !== null);
+
+        try {
+            if ($this->ledger->hasSynced('activity', $ccId)) {
+                return new RecordResult('activity', $ccId, null, SyncStatus::Skipped);
+            }
+        } catch (\Throwable $e) {
+            $this->logger->error('Activity ledger read failed for {id} — aborting run so the window is not advanced: {error}', ['id' => $ccId, 'error' => $e->getMessage()]);
+
+            throw $e;
+        }
+
+        $record = $this->syncActivityToCrm($activity, $typeMapping);
+
+        if ($record->status !== SyncStatus::Failed) {
+            try {
+                $this->ledger->recordSynced('activity', $ccId, $record->targetId);
+            } catch (\Throwable $e) {
+                $this->logger->error('Activity ledger write failed for {id} (CRM id {crm}): {error}', [
+                    'id' => $ccId,
+                    'crm' => $record->targetId,
+                    'error' => $e->getMessage(),
+                ]);
+
+                return new RecordResult('activity', $ccId, $record->targetId, SyncStatus::Failed, errorMessage: 'created in CRM but ledger write failed: ' . $e->getMessage());
+            }
+        }
+
+        return $record;
     }
 
     /**
