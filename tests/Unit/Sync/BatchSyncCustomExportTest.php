@@ -244,4 +244,210 @@ final class BatchSyncCustomExportTest extends TestCase
     {
         yield from $items;
     }
+
+    public function testExportOffsetAccountsForRowsThatLeaveTheFilteredSet(): void
+    {
+        // The export_filter is pushed into the CC query and a successful
+        // write-back renames the record OUT of that filter, so the result set
+        // shrinks underneath the pagination. Advancing the offset by the full
+        // batch count skipped rows that slid down into the window — and once
+        // lastSyncTime advanced they were lost for good.
+        $rows = [
+            ['id' => 'c1', 'title' => 'A'],
+            ['id' => 'c2', 'title' => 'B'],
+            ['id' => 'c3', 'title' => 'C'],
+        ];
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('iterateEntity')->willReturnCallback(
+            function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
+                yield from array_slice($rows, $offset);
+            },
+        );
+        // write-back rename = the record leaves the filtered set
+        $ccAdapter->method('updateContact')->willReturnCallback(
+            function (string $id, Contact $contact) use (&$rows): Contact {
+                $rows = array_values(array_filter($rows, fn (array $r) => $r['id'] !== $id));
+
+                return $contact;
+            },
+        );
+
+        $exported = [];
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $crmAdapter->method('createCustomEntity')->willReturnCallback(
+            function (string $target, array $data) use (&$exported): array {
+                $exported[] = $data['name'];
+
+                return ['id' => count($exported)];
+            },
+        );
+
+        $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 2);
+
+        $batches = 0;
+        do {
+            $result = $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
+            self::assertLessThan(10, ++$batches, 'export loop must terminate');
+        } while (!$result->isExhausted());
+
+        self::assertSame(['A', 'B', 'C'], $exported, 'every row must be exported exactly once');
+        self::assertSame([], $rows, 'all rows left the filtered set');
+    }
+
+    public function testExportSpinGuardAdvancesWhenWriteBackDoesNotShrinkTheSet(): void
+    {
+        // Degenerate config: write_back "succeeds" but writes fields the
+        // export_filter does not check, so rows never leave the set. Without the
+        // guard the same batch would be re-served forever.
+        $rows = [
+            ['id' => 'c1', 'title' => 'A'],
+            ['id' => 'c2', 'title' => 'B'],
+            ['id' => 'c3', 'title' => 'C'],
+        ];
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('iterateEntity')->willReturnCallback(
+            function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
+                yield from array_slice($rows, $offset);
+            },
+        );
+        // write-back runs fine but does NOT remove the row from the set
+        $ccAdapter->method('updateContact')->willReturnArgument(1);
+
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $crmAdapter->method('createCustomEntity')->willReturn(['id' => 1]);
+
+        $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 2);
+
+        $batches = 0;
+        do {
+            $result = $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
+            self::assertLessThan(10, ++$batches, 'spin guard must terminate the loop');
+        } while (!$result->isExhausted());
+
+        self::assertGreaterThanOrEqual(3, $batches, 'guard advances only after detecting the repeat');
+    }
+
+    public function testExportLookupResolvesDottedCrmField(): void
+    {
+        // On export the lookup key addresses the mapped (CRM-side) payload, and
+        // dotted fields are written nested — flat access returned null, silently
+        // skipped the existence check and created a duplicate on every run.
+        $mapping = new MappingCollection('contact_export', 'custom.ext_id', [
+            new FieldMapping('title', 'name'),
+            new FieldMapping('id', 'custom.ext_id'),
+        ]);
+
+        $ccAdapter = $this->ccAdapterYielding(self::ROWS);
+
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->expects(self::once())
+            ->method('findCustomEntityByLookup')
+            ->with('persons', 'custom.ext_id', 'contact_abc')
+            ->willReturn(['id' => 7]);
+        $crmAdapter->expects(self::never())->method('createCustomEntity');
+        $crmAdapter->expects(self::once())
+            ->method('updateCustomEntity')
+            ->with('persons', '7', self::anything())
+            ->willReturn(['id' => 7]);
+
+        $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 100);
+        $result = $batchSync->syncCustomEntity($this->entry(), $mapping);
+
+        self::assertSame(1, $result->getUpdatedCount());
+    }
+
+
+    public function testCapPreventsStrandingUnderPageFaithfulMutation(): void
+    {
+        // The motivating property of EXPORT_BATCH_LIMIT: the adapter serves
+        // internal pages of 100 whose skip is computed against the CURRENT set.
+        // Without the cap, one 250-row batch would consume page 1 (100 rows, all
+        // departing), then fetch page 2 at skip=100 against the 50-row shrunken
+        // set -> empty -> "exhausted" -> rows 101-150 stranded forever. With the
+        // cap, the generator is abandoned before page 2 is ever requested.
+        $rows = [];
+        for ($i = 1; $i <= 150; $i++) {
+            $rows[] = ['id' => 'c' . $i, 'title' => 'T' . $i];
+        }
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('iterateEntity')->willReturnCallback(
+            function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
+                // Page-faithful fake: pages of 100, each re-sliced against the
+                // live set — exactly the real adapter's skip += pageSize walk.
+                $cursor = $offset;
+                while (true) {
+                    $page = array_slice($rows, $cursor, ContactCentreAdapterInterface::ITERATE_PAGE_SIZE);
+                    if ($page === []) {
+                        return;
+                    }
+                    yield from $page;
+                    $cursor += ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
+                }
+            },
+        );
+        // write-back rename = the record leaves the filtered set
+        $ccAdapter->method('updateContact')->willReturnCallback(
+            function (string $id, Contact $contact) use (&$rows): Contact {
+                $rows = array_values(array_filter($rows, fn (array $r) => $r['id'] !== $id));
+
+                return $contact;
+            },
+        );
+
+        $exported = [];
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $crmAdapter->method('createCustomEntity')->willReturnCallback(
+            function (string $target, array $data) use (&$exported): array {
+                $exported[] = $data['name'];
+
+                return ['id' => count($exported)];
+            },
+        );
+
+        $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 250);
+
+        $batches = 0;
+        do {
+            $result = $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
+            self::assertLessThan(10, ++$batches, 'export loop must terminate');
+        } while (!$result->isExhausted());
+
+        self::assertCount(150, $exported, 'every row must be exported despite batch_size > page size');
+        self::assertSame([], $rows, 'all rows left the filtered set');
+    }
+
+    private function exportBatchSync(
+        ContactCentreAdapterInterface $ccAdapter,
+        CrmAdapterInterface $crmAdapter,
+        int $batchSize,
+    ): BatchSync {
+        $stateStore = $this->createMock(SyncStateStoreInterface::class);
+        $stateStore->method('getLastSyncTime')->willReturn(new \DateTimeImmutable('-1 hour'));
+
+        $config = new SyncConfiguration(
+            instanceUrl: 'https://test.daktela.com',
+            accessToken: 'test-token',
+            database: 'test-db',
+            batchSize: $batchSize,
+            entities: [],
+            mappings: [],
+            customEntities: [$this->entry(withWriteBack: true)],
+            customEntityMappings: ['contact_export' => $this->mapping()],
+        );
+
+        return new BatchSync(
+            $ccAdapter,
+            $crmAdapter,
+            new FieldMapper(TransformerRegistry::withDefaults()),
+            $config,
+            new NullLogger(),
+            $stateStore,
+        );
+    }
 }

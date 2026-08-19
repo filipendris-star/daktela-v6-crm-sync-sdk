@@ -650,7 +650,12 @@ final class BatchSync
             $mapped = $this->fieldMapper->map($entity, $mapping, SyncDirection::CcToCrm, $this->relationMaps);
 
             $existing = null;
-            $lookupValue = $mapped[$mapping->lookupField] ?? null;
+            // NOTE: on export the lookup key addresses the *mapped* (CRM-side)
+            // payload — lookup_field must name the CRM field here, unlike imports
+            // where it names the CC field. Nested-aware so dotted lookup fields
+            // (custom-field paths) resolve instead of silently skipping the
+            // existence check and duplicating records on every run.
+            $lookupValue = NestedValue::get($mapped, $mapping->lookupField);
             if (is_scalar($lookupValue) && (string) $lookupValue !== '') {
                 $existing = $writer->findCustomEntityByLookup($entry->target, $mapping->lookupField, (string) $lookupValue);
             }
