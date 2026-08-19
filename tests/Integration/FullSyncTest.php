@@ -263,6 +263,33 @@ final class FullSyncTest extends TestCase
         self::assertArrayNotHasKey('account', $state);
     }
 
+
+    public function testAccountStepWhereEveryRecordFailedAlsoGatesContacts(): void
+    {
+        // The gate must not key on "the drain threw": a step in which every record
+        // failed produced no relation maps either, and it is the same condition
+        // saveState() already refuses to advance the watermark for. Otherwise
+        // contacts write raw CRM foreign keys and the run reports itself clean.
+        $crm = new FakeCrmAdapter(
+            contacts: [Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@t.com', 'company_id' => 'crm-a9'])],
+            accounts: [Account::fromArray(['id' => 'crm-a9', 'company_name' => 'Acme', 'external_id' => 'acme9'])],
+        );
+        $cc = new FakeCcAdapter();
+        $cc->failAccountOn('acme9');
+
+        $results = $this->engine($crm, $cc)->fullSync();
+
+        self::assertTrue($results->hasStepFailures(), 'an all-failed step must not report a clean run');
+        self::assertArrayHasKey('account', $results->stepFailures);
+        self::assertArrayHasKey('contact', $results->stepFailures, 'the dependent step is gated too');
+        self::assertSame([], $cc->contacts, 'no contact may be written with unresolved relations');
+
+        $state = is_file($this->stateFile)
+            ? (array) json_decode((string) file_get_contents($this->stateFile), true)
+            : [];
+        self::assertArrayNotHasKey('contact', $state);
+    }
+
     private function engine(
         FakeCrmAdapter $crm,
         FakeCcAdapter $cc,

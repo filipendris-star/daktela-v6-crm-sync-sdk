@@ -143,8 +143,9 @@ Two failure levels exist and they need different handling:
   advances (unless *every* record failed).
 - **step-level** failures — `$results->stepFailures` (entity type => message),
   a whole step that failed or was skipped: an adapter fault, a misconfiguration,
-  or a skipped dependent. The step's sync window is deliberately **not** advanced,
-  so nothing edited during the outage falls out of the incremental window.
+  every one of its records failing, or a dependency of it having failed. The
+  step's sync window is deliberately **not** advanced, so nothing edited during
+  the outage falls out of the incremental window.
 
 `fullSync()` returns normally even when steps failed, so a scheduler must check
 `hasStepFailures()` — otherwise a total outage looks like a successful run:

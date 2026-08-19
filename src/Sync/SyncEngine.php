@@ -77,6 +77,21 @@ final class SyncEngine
             $result->finish();
             $this->saveState($entityType, $syncStartTime, $result);
 
+            // A step in which every record failed produced nothing usable — the
+            // same condition saveState() refuses to advance the watermark for. It
+            // must count as a failed step, or dependents would run against state it
+            // never produced and the run would report itself clean.
+            if ($result->getTotalCount() > 0 && $result->getFailedCount() === $result->getTotalCount()) {
+                $message = sprintf('all %d records failed', $result->getFailedCount());
+                $this->logger->error('Sync step {entityType}: {message}', [
+                    'entityType' => $entityType,
+                    'message' => $message,
+                ]);
+                $this->stepFailures[$entityType] = $message;
+
+                return false;
+            }
+
             return true;
         } catch (\Throwable $e) {
             $this->logger->error('Sync step {entityType} failed: {error}', [
