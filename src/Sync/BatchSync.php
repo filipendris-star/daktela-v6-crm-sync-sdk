@@ -55,10 +55,13 @@ final class BatchSync
     /**
      * Upper bound on consecutive record-less pages within one drain. A filtered
      * search may legitimately return many (every row on the page filtered out
-     * server-side), so this is deliberately generous — it exists only to stop a
-     * runaway adapter that keeps issuing fresh tokens without ever finishing.
+     * server-side), so this is deliberately far above any real scan — it exists
+     * only to stop a runaway adapter that keeps issuing fresh tokens without ever
+     * finishing. Set high on purpose: tripping it splits the drain across runs, and
+     * a drain finishing in a later run stamps that run's start time as the
+     * watermark, so a false positive would cost more than the runaway it guards.
      */
-    private const MAX_EMPTY_CURSOR_PAGES = 1000;
+    private const MAX_EMPTY_CURSOR_PAGES = 10000;
 
 
     private bool $forceFullSync = false;

@@ -231,14 +231,14 @@ final class BatchSyncCursorPaginationTest extends TestCase
         // The other runaway shape: tokens keep advancing but no page ever yields a
         // record and nextCursor is never null (a `has_more` that is never false).
         // The same-token check cannot see this, so the drain needs an upper bound.
-        $store = new FileSyncStateStore($this->stateFile);
+        $store = new InMemoryCursorStore();
         $adapter = new AlwaysEmptyAdvancingCursorAdapter();
 
         $batch = $this->batchSync($adapter, $store, batchSize: 2);
 
         $threw = false;
         try {
-            for ($i = 0; $i < 5000; $i++) {
+            for ($i = 0; $i < 10100; $i++) {
                 $batch->syncContacts();
             }
         } catch (\Daktela\CrmSync\Exception\AdapterException) {
@@ -246,14 +246,14 @@ final class BatchSyncCursorPaginationTest extends TestCase
         }
 
         self::assertTrue($threw, 'a drain that never yields a record must be bounded');
-        self::assertLessThan(2000, $adapter->calls, 'bounded well before 5000 requests');
+        self::assertLessThan(10100, $adapter->calls, 'the drain was bounded, not run to the loop limit');
     }
 
     public function testDrainIsNotWedgedAfterTheRunawayBoundTrips(): void
     {
         // The counter is drain-scoped and cleared when it trips, so the next run
         // gets a full attempt instead of failing after a single page forever.
-        $store = new FileSyncStateStore($this->stateFile);
+        $store = new InMemoryCursorStore();
         $adapter = new AlwaysEmptyAdvancingCursorAdapter();
         $batch = $this->batchSync($adapter, $store, batchSize: 2);
 
@@ -269,7 +269,7 @@ final class BatchSyncCursorPaginationTest extends TestCase
         $before = $adapter->calls;
 
         try {
-            for ($i = 0; $i < 5000; $i++) {
+            for ($i = 0; $i < 10100; $i++) {
                 $batch->syncContacts();
             }
         } catch (\Daktela\CrmSync\Exception\AdapterException) {
@@ -279,7 +279,7 @@ final class BatchSyncCursorPaginationTest extends TestCase
         return $adapter->calls - $before;
     }
 
-    private function batchSync(CrmAdapterInterface $crm, FileSyncStateStore $store, int $batchSize): BatchSync
+    private function batchSync(CrmAdapterInterface $crm, \Daktela\CrmSync\State\SyncStateStoreInterface $store, int $batchSize): BatchSync
     {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
         $ccAdapter->method('upsertContact')->willReturnCallback(
@@ -320,5 +320,46 @@ final class AlwaysEmptyAdvancingCursorAdapter extends FakeCursorCrmAdapter
         $next = (int) ($cursor ?? '0') + $limit;
 
         return new CursorPage([], (string) $next);
+    }
+}
+
+/** In-memory state store: the guard tests page thousands of times, and rewriting a file each time dominates their runtime. */
+final class InMemoryCursorStore implements \Daktela\CrmSync\State\SyncStateStoreInterface
+{
+    /** @var array<string, \DateTimeImmutable> */
+    private array $times = [];
+
+    /** @var array<string, ?string> */
+    private array $cursors = [];
+
+    public function getLastSyncTime(string $entityType): ?\DateTimeImmutable
+    {
+        return $this->times[$entityType] ?? null;
+    }
+
+    public function setLastSyncTime(string $entityType, \DateTimeImmutable $time): void
+    {
+        $this->times[$entityType] = $time;
+    }
+
+    public function getCursor(string $key): ?string
+    {
+        return $this->cursors[$key] ?? null;
+    }
+
+    public function setCursor(string $key, ?string $cursor): void
+    {
+        $this->cursors[$key] = $cursor;
+    }
+
+    public function clear(string $entityType): void
+    {
+        unset($this->times[$entityType], $this->cursors[$entityType]);
+    }
+
+    public function clearAll(): void
+    {
+        $this->times = [];
+        $this->cursors = [];
     }
 }
