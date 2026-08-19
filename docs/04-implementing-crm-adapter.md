@@ -238,9 +238,11 @@ Pipedrive v2 `cursor`, K2 `NextPageURL`) instead of a numeric offset.
 Implement `fetchContactsPage()` / `fetchAccountsPage()` returning a
 `CursorPage(records, nextCursor)`. The engine persists `nextCursor` in the
 sync state between runs, so an interrupted drain resumes instead of
-restarting. Return `nextCursor: null` on the last page — that (or an empty
-page) is what ends the drain; a short page alone does not, because filtered
-searches legitimately return fewer rows than the limit mid-drain.
+restarting. Return `nextCursor: null` on the last page — that, and only that,
+ends the drain: neither a short page nor an empty one does, because filtered
+searches legitimately return fewer rows than the limit (possibly none at all)
+while more pages remain. Never return the token you were given — a page that
+cannot advance the cursor is treated as an adapter fault and aborts the drain.
 
 ### `SupportsCustomEntityWriteInterface`
 
@@ -250,7 +252,9 @@ contacts as CRM persons). Implement `createCustomEntity()` /
 including its `id` so the engine can run identity write-back against the
 source record. Adapters that don't implement it need no stub: the engine
 feature-detects the interface and, for a `cc_to_crm` custom entity slot on a
-non-implementing adapter, logs an error and marks the slot exhausted.
+non-implementing adapter, fails that slot with a `NotSupportedException` —
+deliberately, so the slot's sync window is not advanced over records it never
+exported. The failure is scoped to that slot; other entities still sync.
 
 ### `SupportsDealLinkingInterface`
 

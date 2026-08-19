@@ -49,11 +49,6 @@ final class BatchSync
     /** @var array<string, string|null> "offset:firstRowId" of the previous export batch per key (write-back spin guard) */
     private array $exportSpinGuard = [];
 
-    /** @var array<string, int> Consecutive empty-but-tokened cursor pages per key (adapter spin guard) */
-    private array $emptyCursorPages = [];
-
-    /** Consecutive empty cursor pages tolerated before the drain is treated as an adapter fault. */
-    private const MAX_EMPTY_CURSOR_PAGES = 50;
 
     private bool $forceFullSync = false;
 
@@ -84,7 +79,6 @@ final class BatchSync
         $this->offsets = [];
         $this->cursors = [];
         $this->exportSpinGuard = [];
-        $this->emptyCursorPages = [];
     }
 
     /**
@@ -118,23 +112,21 @@ final class BatchSync
      *
      * @param CursorPage<mixed> $page
      */
-    private function advanceCursor(string $key, CursorPage $page, int $rows, SyncResult $result): void
-    {
-        // Only a null next token ends the drain. An EMPTY page with a live token
-        // is the degenerate case of the short-page rule (a scanned page whose
-        // rows were all filtered out server-side): ending there would clear the
-        // cursor and let the watermark advance over everything behind that token.
-        // Bounded so a faulty adapter handing back an endless stream of empty
-        // tokened pages fails loudly instead of spinning forever.
-        if ($rows === 0 && $page->nextCursor !== null) {
-            $seen = ($this->emptyCursorPages[$key] ?? 0) + 1;
-            $this->emptyCursorPages[$key] = $seen;
-
-            if ($seen > self::MAX_EMPTY_CURSOR_PAGES) {
-                throw AdapterException::cursorPaginationStalled($key, $seen);
-            }
-        } else {
-            unset($this->emptyCursorPages[$key]);
+    private function advanceCursor(
+        string $key,
+        CursorPage $page,
+        int $rows,
+        SyncResult $result,
+        ?string $requestedCursor,
+    ): void {
+        // A page that hands back the very token it was asked for cannot advance:
+        // the engine's drain loop would request it forever. That is the only
+        // definitive stall signal — an EMPTY page with a *new* token is legitimate
+        // (a scanned page whose rows were all filtered out server-side), and
+        // treating it as the end would clear the cursor and let the watermark
+        // advance over everything behind that token.
+        if ($page->nextCursor !== null && $page->nextCursor === $requestedCursor) {
+            throw AdapterException::cursorPaginationStalled($key, $requestedCursor);
         }
 
         $exhausted = $page->nextCursor === null;
@@ -200,7 +192,7 @@ final class BatchSync
             foreach ($page->records as $contact) {
                 $result->addRecord($this->syncEntityToCc($contact, $mapping, 'contact', $upsertFn));
             }
-            $this->advanceCursor('contact', $page, count($page->records), $result);
+            $this->advanceCursor('contact', $page, count($page->records), $result, $cursor);
         } else {
             $offset = $this->offsets['contact'] ?? 0;
             $count = 0;
@@ -260,11 +252,12 @@ final class BatchSync
 
         if ($this->crmAdapter instanceof SupportsCursorPaginationInterface) {
             $limit = $this->config->batchSize;
-            $page = $this->crmAdapter->fetchAccountsPage($since, $this->resolveCursor('account'), $limit);
+            $cursor = $this->resolveCursor('account');
+            $page = $this->crmAdapter->fetchAccountsPage($since, $cursor, $limit);
             foreach ($page->records as $account) {
                 $processAccount($account);
             }
-            $this->advanceCursor('account', $page, count($page->records), $result);
+            $this->advanceCursor('account', $page, count($page->records), $result, $cursor);
         } else {
             $offset = $this->offsets['account'] ?? 0;
             $count = 0;

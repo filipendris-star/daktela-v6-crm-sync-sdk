@@ -177,23 +177,52 @@ final class BatchSyncCursorPaginationTest extends TestCase
         self::assertTrue($r2->isExhausted());
     }
 
-    public function testEndlessEmptyTokenedPagesAbortInsteadOfSpinning(): void
+    public function testAdapterReturningTheTokenItWasGivenAbortsImmediately(): void
     {
+        // A page handing back the very token it was asked for cannot advance —
+        // the drain loop would request it forever. That must fail on the spot,
+        // not after an arbitrary number of retries.
         $store = new FileSyncStateStore($this->stateFile);
 
-        // Faulty adapter: every page is empty but keeps handing back a token.
         $adapter = new FakeCursorCrmAdapter([
-            null => new CursorPage([], 'LOOP'),
-            'LOOP' => new CursorPage([], 'LOOP'),
+            null => new CursorPage([$this->contact('c1')], 'LOOP'),
+            'LOOP' => new CursorPage([$this->contact('c2')], 'LOOP'),
         ]);
 
         $batch = $this->batchSync($adapter, $store, batchSize: 2);
 
-        $this->expectException(\Daktela\CrmSync\Exception\AdapterException::class);
+        $batch->syncContacts(); // page 1: null -> 'LOOP', legitimate progress
 
-        for ($i = 0; $i < 200; $i++) {
-            $batch->syncContacts();
+        $this->expectException(\Daktela\CrmSync\Exception\AdapterException::class);
+        $batch->syncContacts(); // page 2: 'LOOP' -> 'LOOP', no progress
+    }
+
+    public function testManyEmptyTokenedPagesAreLegitimateAndKeepDraining(): void
+    {
+        // A filtered search can return page after page of "nothing matched here"
+        // with advancing tokens. That is declared legal by the interface, so the
+        // drain must keep going — and a long-lived BatchSync must not accumulate
+        // any state that eventually turns it into a fault.
+        $store = new FileSyncStateStore($this->stateFile);
+
+        $pages = [null => new CursorPage([], 'T1')];
+        for ($i = 1; $i < 120; $i++) {
+            $pages['T' . $i] = new CursorPage([], 'T' . ($i + 1));
         }
+        $pages['T120'] = new CursorPage([$this->contact('c1')], null);
+
+        $adapter = new FakeCursorCrmAdapter($pages);
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+
+        $drains = 0;
+        do {
+            $result = $batch->syncContacts();
+            self::assertLessThan(200, ++$drains, 'drain must terminate');
+        } while (!$result->isExhausted());
+
+        self::assertSame(121, $drains, 'every page was requested');
+        self::assertSame(1, $result->getTotalCount(), 'the record behind the last token was read');
+        self::assertNull($store->getCursor('contact'));
     }
 
     private function batchSync(CrmAdapterInterface $crm, FileSyncStateStore $store, int $batchSize): BatchSync
