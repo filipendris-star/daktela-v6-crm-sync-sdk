@@ -194,4 +194,40 @@ final class DaktelaAdapterTest extends TestCase
             true,
         ];
     }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('callStateProvider')]
+    public function testFlattenActivityRowDerivesCallState(array $item, ?string $expected): void
+    {
+        $adapter = new DaktelaAdapter(
+            'https://test.daktela.com',
+            'test-token',
+            'test-db',
+            new NullLogger(),
+        );
+
+        $method = new \ReflectionMethod($adapter, 'flattenActivityRow');
+        $row = $method->invoke($adapter, ['item' => $item]);
+
+        self::assertSame($expected, $row['item_call_state'] ?? null);
+    }
+
+    /** @return iterable<string, array{array<string, mixed>, ?string}> */
+    public static function callStateProvider(): iterable
+    {
+        yield 'outgoing answered' => [['direction' => 'out', 'answered' => 1], 'out_answered'];
+        yield 'outgoing no answer' => [['direction' => 'out', 'answered' => 0], 'out_noanswer'];
+        yield 'incoming answered' => [['direction' => 'in', 'answered' => 1], 'in_answered'];
+        yield 'incoming missed' => [['direction' => 'in', 'answered' => 0], 'in_missed'];
+        yield 'internal answered' => [['direction' => 'internal', 'answered' => 1], 'internal_answered'];
+        yield 'internal no answer' => [['direction' => 'internal', 'answered' => 0], 'internal_noanswer'];
+
+        // The v6 API serialises the flags as strings too — "0" must not read as answered.
+        yield 'string flags' => [['direction' => 'out', 'answered' => '0'], 'out_noanswer'];
+
+        // SMS items carry a direction but no answered flag: no state must be derived,
+        // so per-type sms mappings never see a bogus item_call_state.
+        yield 'sms-like item without answered' => [['direction' => 'in', 'text' => 'hi'], null];
+
+        yield 'item without direction' => [['answered' => 1], null];
+    }
 }
