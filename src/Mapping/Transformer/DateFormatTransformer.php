@@ -26,6 +26,11 @@ final class DateFormatTransformer implements ValueTransformerInterface
      * Using named zones (not fixed offsets) means DST is handled per-date, so a
      * summer time converts at +2h and a winter time at +1h automatically.
      *
+     * to_tz only applies when the `from` format carries time-of-day. A date-only
+     * value is not an instant — shifting it across zones would move the date a
+     * whole day backward east of UTC while silently "working" west of it — so for
+     * date-only formats the conversion is skipped and the date passes through.
+     *
      * @param array<string, mixed> $params
      */
     public function transform(mixed $value, array $params = []): mixed
@@ -42,7 +47,17 @@ final class DateFormatTransformer implements ValueTransformerInterface
             : date_default_timezone_get());
         $toTz = isset($params['to_tz']) ? new \DateTimeZone((string) $params['to_tz']) : null;
 
-        $date = \DateTimeImmutable::createFromFormat($from, (string) $value, $fromTz);
+        if ($toTz !== null && !$this->formatCarriesTime($from)) {
+            $toTz = null;
+        }
+
+        // Anchor unspecified fields to zero (via `|`) instead of letting
+        // createFromFormat fill them from "now": with to_tz set, a date-only
+        // input would otherwise shift by a whole day depending on the time of
+        // day the sync happens to run.
+        $anchoredFrom = str_contains($from, '!') || str_contains($from, '|') ? $from : $from . '|';
+
+        $date = \DateTimeImmutable::createFromFormat($anchoredFrom, (string) $value, $fromTz);
         if ($date === false) {
             // Try parsing as any recognizable format
             try {
@@ -57,5 +72,17 @@ final class DateFormatTransformer implements ValueTransformerInterface
         }
 
         return $date->format($to);
+    }
+
+    /**
+     * True when the format parses a time of day (hour/minute/second/fraction or
+     * a unix timestamp). Backslash-escaped characters are literals, not
+     * specifiers, and don't count.
+     */
+    private function formatCarriesTime(string $format): bool
+    {
+        $specifiers = preg_replace('/\\\\./', '', $format) ?? $format;
+
+        return preg_match('/[HGhgisvuU]/', $specifiers) === 1;
     }
 }
