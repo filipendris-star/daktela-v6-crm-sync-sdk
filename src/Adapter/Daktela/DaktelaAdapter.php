@@ -255,6 +255,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         }
 
         $login = null;
+        $lookupFailed = false;
 
         foreach (['email', 'emailAuth'] as $field) {
             $request = RequestFactory::buildReadRequest('Users');
@@ -263,6 +264,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
 
             $response = $this->client->execute($request);
             if ($response->hasErrors()) {
+                $lookupFailed = true;
                 continue;
             }
 
@@ -274,6 +276,13 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
                     break;
                 }
             }
+        }
+
+        // Only cache a negative result when every lookup genuinely returned
+        // "not found" — caching a transient API failure as null would strip the
+        // owner from every subsequent record in the run.
+        if ($login === null && $lookupFailed) {
+            return null;
         }
 
         return $this->userLoginCache[$cacheKey] = $login;
