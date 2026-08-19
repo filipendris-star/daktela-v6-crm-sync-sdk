@@ -15,6 +15,11 @@ class AdapterException extends SyncException
         );
     }
 
+    public static function queryFailed(string $entityType, string $detail): self
+    {
+        return new self(sprintf('Query for %s failed: %s', $entityType, $detail));
+    }
+
     public static function createFailed(string $entityType, ?\Throwable $previous = null, string $detail = ''): self
     {
         $message = sprintf('Failed to create %s', $entityType);

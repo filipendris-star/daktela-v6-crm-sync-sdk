@@ -177,7 +177,13 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
             $request->addFilter((string) $filter['field'], (string) $filter['operator'], $filter['value']);
         }
 
-        $pageSize = 100;
+        // Stable, explicit ordering: the export layer's offset arithmetic assumes
+        // rows keep deterministic positions between successive page requests, so
+        // relying on the server's unspecified default order (which can shift as
+        // records are edited mid-drain) would corrupt the pagination.
+        $request->addSort('name', 'asc');
+
+        $pageSize = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
         $currentOffset = $offset;
 
         while (true) {
@@ -187,7 +193,15 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
 
             $response = $this->client->execute($pageRequest);
 
-            if ($response->hasErrors() || $response->isEmpty()) {
+            // An API-level error (bad filter field, invalid since_field, ...) must
+            // fail loudly: quietly ending the enumeration reports an empty, clean
+            // batch, the incremental window advances, and every record in it is
+            // silently skipped forever.
+            if ($response->hasErrors()) {
+                throw AdapterException::queryFailed($entityType, json_encode($response->getErrors()) ?: 'unknown error');
+            }
+
+            if ($response->isEmpty()) {
                 return;
             }
 
@@ -362,7 +376,11 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
             $request->addFilter('time_close', 'gte', $since->format('Y-m-d H:i:s'));
         }
 
-        $pageSize = 100;
+        // Stable ordering — offset pagination across pages (and across batches in
+        // the sync layer) needs deterministic row positions.
+        $request->addSort('name', 'asc');
+
+        $pageSize = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
         $currentOffset = $offset;
 
         while (true) {
@@ -372,7 +390,13 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
 
             $response = $this->client->execute($pageRequest);
 
-            if ($response->hasErrors() || $response->isEmpty()) {
+            // See iterateEntity(): a swallowed API error would let the incremental
+            // window advance over records that were never read.
+            if ($response->hasErrors()) {
+                throw AdapterException::queryFailed('activity', json_encode($response->getErrors()) ?: 'unknown error');
+            }
+
+            if ($response->isEmpty()) {
                 return;
             }
 

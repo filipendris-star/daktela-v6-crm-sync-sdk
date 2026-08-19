@@ -11,6 +11,15 @@ use Daktela\CrmSync\Entity\Contact;
 
 interface ContactCentreAdapterInterface
 {
+    /**
+     * Internal page size of the iterate* generators. BatchSync's export batch
+     * cap (EXPORT_BATCH_LIMIT) must never exceed this: consuming past one page
+     * while write-backs shrink the filtered set strands rows (the next page's
+     * skip is computed against the original set). Implementations must page by
+     * exactly this value.
+     */
+    public const ITERATE_PAGE_SIZE = 100;
+
     // Contacts (writable — CRM is source-of-truth, CC receives data)
     public function findContact(string $id): ?Contact;
 
@@ -44,6 +53,13 @@ interface ContactCentreAdapterInterface
     /**
      * Enumerate CC records of a first-class entity type ("contact" or "account")
      * as raw rows (with `id` populated), for cc_to_crm custom entity export.
+     *
+     * CAUTION for consumers that mutate the filtered result set while iterating
+     * (the export's write-back renames records out of the $filters match): the
+     * implementation pages internally by a fixed page size, and its next-page
+     * skip is computed against the ORIGINAL set — consuming past the first page
+     * under mutation lands the skip past unread rows. The export layer therefore
+     * caps one batch at the page size (see BatchSync::EXPORT_BATCH_LIMIT).
      *
      * @param array<int, array{field: string, operator: string, value: mixed}> $filters
      *        additional API-level filters (e.g. an export filter excluding
