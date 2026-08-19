@@ -886,10 +886,12 @@ final class BatchSync
                 $mappedActivity = $this->crmAdapter->linkActivityToDeal($mappedActivity, $linkDeal);
             }
 
-            // With a ledger the existence check already happened (this record is
-            // new), so create directly — no CRM-side lookup. Without one, fall
-            // back to the adapter's upsert (find-then-create/update).
-            if ($this->ledger !== null) {
+            // Create directly only when the ledger actually performed the
+            // existence check for this record — which requires a CC id. An
+            // id-less activity was never ledger-checked and can never be
+            // recorded, so it must keep the adapter's upsert (lookup-then-write)
+            // or it would be re-created on every run.
+            if ($this->ledger !== null && (string) $activity->getId() !== '') {
                 $result = $this->crmAdapter->createActivity($mappedActivity);
 
                 return new RecordResult(

@@ -105,6 +105,32 @@ final class BatchSyncLedgerTest extends TestCase
         self::assertSame(1, $result->getTotalCount());
     }
 
+
+    public function testIdLessActivityKeepsUpsertDedupWhenLedgerIsSet(): void
+    {
+        // The ledger can neither check nor record an activity without a CC id, so
+        // create-without-lookup would re-create it on every run. It must fall back
+        // to the adapter's upsert (lookup-then-write) instead.
+        $ledger = new InMemoryLedger();
+
+        $idLess = Activity::fromArray(['title' => 'No id call']);
+        $idLess->setActivityType(ActivityType::Call);
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('iterateActivities')->willReturn($this->gen([$idLess]));
+
+        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
+        $crmAdapter->expects(self::never())->method('createActivity');
+        $crmAdapter->expects(self::once())
+            ->method('upsertActivity')
+            ->willReturn(Activity::fromArray(['id' => 'crm-1']));
+
+        $result = $this->batchSync($ccAdapter, $crmAdapter, $ledger)->syncActivities([ActivityType::Call]);
+
+        self::assertSame(1, $result->getTotalCount());
+        self::assertSame([], $ledger->recorded, 'nothing can be recorded without a CC id');
+    }
+
     private function activity(string $id): Activity
     {
         $activity = Activity::fromArray(['id' => $id, 'name' => $id, 'title' => 'Call ' . $id]);
