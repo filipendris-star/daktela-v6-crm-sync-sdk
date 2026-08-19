@@ -201,7 +201,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         // records are edited mid-drain) would corrupt the pagination.
         $request->addSort('name', 'asc');
 
-        $pageSize = static::ITERATE_PAGE_SIZE;
+        $pageSize = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
         $currentOffset = $offset;
 
         while (true) {
@@ -398,7 +398,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         // the sync layer) needs deterministic row positions.
         $request->addSort('name', 'asc');
 
-        $pageSize = static::ITERATE_PAGE_SIZE;
+        $pageSize = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
         $currentOffset = $offset;
 
         while (true) {
