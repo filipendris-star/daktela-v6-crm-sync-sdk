@@ -14,7 +14,9 @@ use Daktela\CrmSync\State\SyncLedgerInterface;
 use Daktela\CrmSync\State\SyncStateStoreInterface;
 use Daktela\CrmSync\Sync\Result\AccountSyncResult;
 use Daktela\CrmSync\Sync\Result\FullSyncResult;
+use Daktela\CrmSync\Sync\Result\RecordResult;
 use Daktela\CrmSync\Sync\Result\SyncResult;
+use Daktela\CrmSync\Sync\Result\SyncStatus;
 use Psr\Log\LoggerInterface;
 
 final class SyncEngine
@@ -57,6 +59,32 @@ final class SyncEngine
      * dedupe one-way exports the CRM cannot search server-side (activities).
      * When unset, exports fall back to the adapter's own upsert/lookup.
      */
+    /**
+     * Run one entity's drain in isolation. A step that throws (adapter fault,
+     * misconfiguration) must not abort the other steps — the documented contract
+     * is that a failure in one entity does not prevent the others from running —
+     * and its watermark must NOT be saved, so nothing edited during the outage
+     * falls out of the incremental window. The failure is recorded in that step's
+     * result so the caller still sees it in FullSyncResult.
+     *
+     * @param callable(): void $drain
+     */
+    private function runIsolated(string $entityType, SyncResult $result, \DateTimeImmutable $syncStartTime, callable $drain): void
+    {
+        try {
+            $drain();
+            $result->finish();
+            $this->saveState($entityType, $syncStartTime, $result);
+        } catch (\Throwable $e) {
+            $this->logger->error('Sync step {entityType} failed: {error}', [
+                'entityType' => $entityType,
+                'error' => $e->getMessage(),
+            ]);
+            $result->addRecord(new RecordResult($entityType, null, null, SyncStatus::Failed, $e->getMessage()));
+            $result->finish();
+        }
+    }
+
     public function setLedger(?SyncLedgerInterface $ledger): void
     {
         $this->batchSync->setLedger($ledger);
@@ -92,20 +120,20 @@ final class SyncEngine
                 $syncStartTime = new \DateTimeImmutable();
                 $accountResult = new SyncResult();
                 $autoContactResult = new SyncResult();
-                do {
-                    $batch = $this->batchSync->syncAccounts();
-                    if ($onBatch !== null) {
-                        $onBatch('account', $batch->account);
-                        if ($batch->autoContact->getTotalCount() > 0) {
-                            $onBatch('auto_contact', $batch->autoContact);
+                $this->runIsolated('account', $accountResult, $syncStartTime, function () use (&$accountResult, &$autoContactResult, $onBatch): void {
+                    do {
+                        $batch = $this->batchSync->syncAccounts();
+                        if ($onBatch !== null) {
+                            $onBatch('account', $batch->account);
+                            if ($batch->autoContact->getTotalCount() > 0) {
+                                $onBatch('auto_contact', $batch->autoContact);
+                            }
                         }
-                    }
-                    $accountResult->mergeCounts($batch->account);
-                    $autoContactResult->mergeCounts($batch->autoContact);
-                } while (!$batch->account->isExhausted());
-                $accountResult->finish();
+                        $accountResult->mergeCounts($batch->account);
+                        $autoContactResult->mergeCounts($batch->autoContact);
+                    } while (!$batch->account->isExhausted());
+                });
                 $autoContactResult->finish();
-                $this->saveState('account', $syncStartTime, $accountResult);
             }
 
             // Step 2: Build relation maps from contact mapping configs
@@ -120,15 +148,15 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $contactResult = new SyncResult();
-                do {
-                    $batch = $this->batchSync->syncContacts();
-                    if ($onBatch !== null) {
-                        $onBatch('contact', $batch);
-                    }
-                    $contactResult->mergeCounts($batch);
-                } while (!$batch->isExhausted());
-                $contactResult->finish();
-                $this->saveState('contact', $syncStartTime, $contactResult);
+                $this->runIsolated('contact', $contactResult, $syncStartTime, function () use (&$contactResult, $onBatch): void {
+                    do {
+                        $batch = $this->batchSync->syncContacts();
+                        if ($onBatch !== null) {
+                            $onBatch('contact', $batch);
+                        }
+                        $contactResult->mergeCounts($batch);
+                    } while (!$batch->isExhausted());
+                });
             }
 
             // Step 4: Sync activities
@@ -137,15 +165,15 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $activityResult = new SyncResult();
-                do {
-                    $batch = $this->batchSync->syncActivities($activityTypes);
-                    if ($onBatch !== null) {
-                        $onBatch('activity', $batch);
-                    }
-                    $activityResult->mergeCounts($batch);
-                } while (!$batch->isExhausted());
-                $activityResult->finish();
-                $this->saveState('activity', $syncStartTime, $activityResult);
+                $this->runIsolated('activity', $activityResult, $syncStartTime, function () use (&$activityResult, $activityTypes, $onBatch): void {
+                    do {
+                        $batch = $this->batchSync->syncActivities($activityTypes);
+                        if ($onBatch !== null) {
+                            $onBatch('activity', $batch);
+                        }
+                        $activityResult->mergeCounts($batch);
+                    } while (!$batch->isExhausted());
+                });
             }
 
             // Step 5: Sync configured custom entities. Runs after typed slots so relation maps
@@ -169,15 +197,15 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $entryResult = new SyncResult();
-                do {
-                    $batch = $this->batchSync->syncCustomEntity($customEntry, $mapping);
-                    if ($onBatch !== null) {
-                        $onBatch("custom:{$customEntry->name}", $batch);
-                    }
-                    $entryResult->mergeCounts($batch);
-                } while (!$batch->isExhausted());
-                $entryResult->finish();
-                $this->saveState("custom:{$customEntry->name}", $syncStartTime, $entryResult);
+                $this->runIsolated("custom:{$customEntry->name}", $entryResult, $syncStartTime, function () use (&$entryResult, $customEntry, $mapping, $onBatch): void {
+                    do {
+                        $batch = $this->batchSync->syncCustomEntity($customEntry, $mapping);
+                        if ($onBatch !== null) {
+                            $onBatch("custom:{$customEntry->name}", $batch);
+                        }
+                        $entryResult->mergeCounts($batch);
+                    } while (!$batch->isExhausted());
+                });
                 $customEntityResults[$customEntry->name] = $entryResult;
             }
 

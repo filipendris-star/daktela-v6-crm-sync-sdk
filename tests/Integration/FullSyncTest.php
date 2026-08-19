@@ -157,6 +157,85 @@ final class FullSyncTest extends TestCase
         self::assertNotNull($secondCallSince);
     }
 
+
+    public function testOneFailingCustomEntityDoesNotStarveTheOthersOrTheRun(): void
+    {
+        // A cc_to_crm entry whose adapter lacks write support throws (so its own
+        // watermark is not advanced over unexported records). That must stay
+        // scoped to its slot: the other entries and the typed steps still run,
+        // and the caller still receives FullSyncResult.
+        $crm = new FakeCrmAdapter(
+            contacts: [Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@test.com'])],
+            accounts: [Account::fromArray(['id' => 'a1', 'company_name' => 'Acme', 'external_id' => 'acme'])],
+        );
+
+        $exportEntry = new \Daktela\CrmSync\Config\CustomEntitySyncConfig(
+            name: 'persons_export',
+            enabled: true,
+            direction: SyncDirection::CcToCrm,
+            source: 'contact',
+            target: 'persons',
+            mappingFile: 'export.yaml',
+        );
+
+        $engine = $this->engineWithCustomEntities($crm, new FakeCcAdapter(), [$exportEntry]);
+
+        $results = $engine->fullSync();
+
+        // The run completed and reported the failure per entity.
+        self::assertSame(1, $results->contact?->getTotalCount(), 'contacts still synced');
+        $exportResult = $results->customEntities['persons_export'] ?? null;
+        self::assertNotNull($exportResult);
+        self::assertSame(1, $exportResult->getFailedCount(), 'the failing slot is reported as failed');
+
+        // The failing slot's watermark must NOT have been saved.
+        $state = json_decode((string) file_get_contents($this->stateFile), true);
+        self::assertIsArray($state);
+        self::assertArrayNotHasKey('custom:persons_export', $state);
+        self::assertArrayHasKey('contact', $state, 'a healthy step still saves its watermark');
+    }
+
+    /** @param array<int, \Daktela\CrmSync\Config\CustomEntitySyncConfig> $customEntities */
+    private function engineWithCustomEntities(FakeCrmAdapter $crm, FakeCcAdapter $cc, array $customEntities): SyncEngine
+    {
+        $contactMapping = new MappingCollection('contact', 'email', [
+            new FieldMapping('title', 'full_name'),
+            new FieldMapping('email', 'email'),
+        ]);
+        $accountMapping = new MappingCollection('account', 'name', [
+            new FieldMapping('title', 'company_name'),
+            new FieldMapping('name', 'external_id'),
+        ]);
+        $exportMapping = new MappingCollection('contact', 'name', [
+            new FieldMapping('title', 'name'),
+        ]);
+
+        $config = new SyncConfiguration(
+            instanceUrl: 'https://test.daktela.com',
+            accessToken: 'test-token',
+            database: 'test-db',
+            batchSize: 100,
+            entities: [
+                'account' => new EntitySyncConfig(true, SyncDirection::CrmToCc, 'accounts.yaml'),
+                'contact' => new EntitySyncConfig(true, SyncDirection::CrmToCc, 'contacts.yaml'),
+            ],
+            mappings: [
+                'contact' => $contactMapping,
+                'account' => $accountMapping,
+            ],
+            customEntities: $customEntities,
+            customEntityMappings: ['persons_export' => $exportMapping],
+        );
+
+        return new SyncEngine(
+            ccAdapter: $cc,
+            crmAdapter: $crm,
+            config: $config,
+            logger: new NullLogger(),
+            stateStore: new FileSyncStateStore($this->stateFile),
+        );
+    }
+
     private function engine(
         FakeCrmAdapter $crm,
         FakeCcAdapter $cc,
