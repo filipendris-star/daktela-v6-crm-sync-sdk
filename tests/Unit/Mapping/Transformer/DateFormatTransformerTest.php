@@ -206,6 +206,31 @@ final class DateFormatTransformerTest extends TestCase
         yield 'dotted time' => ['01-Jun-2024 14.30'];
     }
 
+    #[\PHPUnit\Framework\Attributes\DataProvider('dateOnlyFallbackValuesProvider')]
+    public function testFallbackParseLeavesDateOnlyValuesUnshifted(string $value, string $expected): void
+    {
+        // date_parse sets hour = 0 as a side effect of a relative token, so these
+        // carry no time and must not be converted — an RFC-2822 date ("Sat, 01 Jun
+        // 2024") is routine in email/CRM exports.
+        $result = $this->transformer->transform($value, [
+            'from' => 'Y-m-d H:i:s',
+            'to' => 'Y-m-d',
+            'from_tz' => 'Europe/Prague',
+            'to_tz' => 'UTC',
+        ]);
+
+        self::assertSame($expected, $result, sprintf('value "%s" is date-only and must not shift', $value));
+    }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function dateOnlyFallbackValuesProvider(): iterable
+    {
+        yield 'rfc 2822 date-only' => ['Sat, 01 Jun 2024', '2024-06-01'];
+        yield 'weekday prefix' => ['Mon 1 Jun 2024', '2024-06-03'];
+        yield 'plain iso date' => ['2024-06-01', '2024-06-01'];
+        yield 'textual date' => ['1 Jun 2024', '2024-06-01'];
+    }
+
     public function testFallbackParseConvertsMeridiemValues(): void
     {
         $result = $this->transformer->transform('2024-06-01 2pm', [

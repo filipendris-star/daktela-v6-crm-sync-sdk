@@ -69,11 +69,16 @@ final class DateFormatTransformer implements ValueTransformerInterface
             // The date-only rule above keys on the configured format, but this
             // path accepted a value the format did not describe: re-apply the
             // rule to the value itself, or a date-only value slipping through a
-            // datetime format would still shift by a whole day. date_parse
-            // reports what it actually parsed, so compact ISO ("20240601T143000"),
-            // "2pm" and "14.30" are correctly recognised as carrying a time.
-            $parsed = date_parse((string) $value);
-            if ($toTz !== null && ($parsed['hour'] ?? false) === false) {
+            // datetime format would still shift by a whole day.
+            //
+            // date_parse reports what it actually parsed, so compact ISO
+            // ("20240601T143000"), "2pm" and "14.30" are recognised as carrying a
+            // time — but it also sets hour = 0 as a side effect of a relative
+            // token, which is why "Sat, 01 Jun 2024" (RFC 2822 date-only) and
+            // "yesterday" must be excluded via the `relative` key. Known limits:
+            // an explicit "midnight" and the bare keyword "today" are treated as
+            // instants.
+            if ($toTz !== null && !$this->valueCarriesTime((string) $value)) {
                 $toTz = null;
             }
         }
@@ -83,6 +88,18 @@ final class DateFormatTransformer implements ValueTransformerInterface
         }
 
         return $date->format($to);
+    }
+
+    /**
+     * True when the VALUE itself parsed a time of day. `hour` alone is not enough:
+     * a relative token (weekday name, "yesterday", "next monday") sets it to 0
+     * without any time being present.
+     */
+    private function valueCarriesTime(string $value): bool
+    {
+        $parsed = date_parse($value);
+
+        return ($parsed['hour'] ?? false) !== false && empty($parsed['relative']);
     }
 
     /**
