@@ -31,6 +31,15 @@ use Psr\Log\LoggerInterface;
 
 final class BatchSync
 {
+    /**
+     * Max rows consumed per custom-entity EXPORT batch. The CC adapter pages
+     * internally; consuming past its first page while write-backs shrink the
+     * filtered set makes the adapter's second-page skip land past unread rows —
+     * permanent loss once the window advances. Capping one batch at the adapter
+     * page size keeps all pagination under the departure-aware offset.
+     */
+    private const EXPORT_BATCH_LIMIT = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
+
     /** @var array<string, array<string, string>> */
     private array $relationMaps = [];
 
@@ -42,6 +51,9 @@ final class BatchSync
 
     /** @var array<string, string|null> In-run resume cursor per key (cursor adapters) */
     private array $cursors = [];
+
+    /** @var array<string, string|null> "offset:firstRowId" of the previous export batch per key (write-back spin guard) */
+    private array $exportSpinGuard = [];
 
     private bool $forceFullSync = false;
 
@@ -71,6 +83,7 @@ final class BatchSync
     {
         $this->offsets = [];
         $this->cursors = [];
+        $this->exportSpinGuard = [];
     }
 
     /**
@@ -540,13 +553,32 @@ final class BatchSync
 
         $offset = $this->offsets[$offsetKey] ?? 0;
         $count = 0;
+        $stillMatching = 0;
+        $firstId = null;
         $exhausted = true;
+        $batchLimit = min($this->config->batchSize, self::EXPORT_BATCH_LIMIT);
 
         foreach ($this->ccAdapter->iterateEntity($entry->source, $since, $offset, $entry->exportFilter, $entry->sinceField) as $row) {
-            $result->addRecord($this->exportCustomRecordToCrm($entry, $mapping, $row));
+            $firstId ??= isset($row['id']) ? (string) $row['id'] : '';
+
+            [$record, $departed] = $this->exportCustomRecordToCrm($entry, $mapping, $row);
+            $result->addRecord($record);
+
+            // The export_filter is pushed into the CC query, and a successful
+            // write-back removes the record from that filtered set. Rows that
+            // departed shrink the set underneath the offset, so advancing by the
+            // full batch count would skip unread rows that slid down into this
+            // window — and once lastSyncTime advances they are lost for good.
+            // Only rows that still match (failures, no write-back) consume offset.
+            // NOTE: id-less rows can't be spin-guarded (see below); they also never
+            // depart (write-back needs a source id), so they always consume offset.
+            if (!$departed) {
+                $stillMatching++;
+            }
+
             $count++;
 
-            if ($count >= $this->config->batchSize) {
+            if ($count >= $batchLimit) {
                 $exhausted = false;
                 break;
             }
@@ -555,7 +587,31 @@ final class BatchSync
         $result->setExhausted($exhausted);
         $result->finish();
 
-        $this->offsets[$offsetKey] = $exhausted ? 0 : $offset + $count;
+        $nextOffset = $offset + $stillMatching;
+
+        // Spin guard: seeing the same first row again at the same offset means the
+        // write-back "succeeded" without actually removing records from the
+        // export_filter (it writes fields the filter doesn't check). Trusting
+        // `departed` again would re-serve this batch forever — advance past it and
+        // flag the config instead. The guard binds offset AND row id (a repeat id
+        // at a different offset is legitimate movement), and ignores id-less rows.
+        $guardValue = ($firstId !== null && $firstId !== '') ? $offset . ':' . $firstId : null;
+        if (!$exhausted && $guardValue !== null
+            && ($this->exportSpinGuard[$offsetKey] ?? null) === $guardValue && $stillMatching < $count) {
+            $this->logger->warning(
+                'Custom entity "{name}" write_back does not remove records from export_filter — advancing past the batch to avoid re-processing it forever; fix the write_back/export_filter pairing',
+                ['name' => $entry->name],
+            );
+            $nextOffset = $offset + $count;
+        }
+        // Only a non-exhausted batch can be the "previous batch" of a legitimate
+        // spin comparison. Storing the guard on an exhausted batch would leave a
+        // stale "offset:id" behind after the drain completes, and a later drain
+        // starting with the same (e.g. persistently failing) first row would
+        // false-match it and over-advance past legitimately departed rows.
+        $this->exportSpinGuard[$offsetKey] = $exhausted ? null : $guardValue;
+
+        $this->offsets[$offsetKey] = $exhausted ? 0 : $nextOffset;
 
         $this->logger->info('Batch custom entity {name} export completed (source: {source}, target: {target})', [
             'name' => $entry->name,
@@ -573,13 +629,18 @@ final class BatchSync
 
     /**
      * @param array<string, mixed> $row
+     * @return array{0: RecordResult, 1: bool} [record, departed] — departed is true
+     *         when the write-back rewrote the CC record, i.e. by convention the
+     *         record no longer matches the export_filter and has left the
+     *         filtered result set (the offset bookkeeping depends on this).
      */
     private function exportCustomRecordToCrm(
         \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
         MappingCollection $mapping,
         array $row,
-    ): RecordResult {
+    ): array {
         $sourceId = isset($row['id']) ? (string) $row['id'] : null;
+        $departed = false;
 
         try {
             /** @var SupportsCustomEntityWriteInterface&CrmAdapterInterface $writer */
@@ -604,7 +665,7 @@ final class BatchSync
                 // failed after the create. Retry it here so the record finally
                 // leaves the export window instead of re-processing forever.
                 if ($entry->writeBack !== [] && $sourceId !== null) {
-                    $this->applyExportWriteBack($entry, $sourceId, $existing);
+                    $departed = $this->applyExportWriteBack($entry, $sourceId, $existing);
                 }
             } else {
                 $created = $writer->createCustomEntity($entry->target, $mapped);
@@ -612,16 +673,16 @@ final class BatchSync
                 $status = SyncStatus::Created;
 
                 if ($entry->writeBack !== [] && $sourceId !== null && $targetId !== null) {
-                    $this->applyExportWriteBack($entry, $sourceId, $created);
+                    $departed = $this->applyExportWriteBack($entry, $sourceId, $created);
                 }
             }
 
-            return new RecordResult(
+            return [new RecordResult(
                 entityType: "custom:{$entry->name}",
                 sourceId: $sourceId,
                 targetId: $targetId,
                 status: $status,
-            );
+            ), $departed];
         } catch (\Throwable $e) {
             $this->logger->error('Failed to export {name} record {id}: {error}', [
                 'name' => $entry->name,
@@ -629,13 +690,13 @@ final class BatchSync
                 'error' => $e->getMessage(),
             ]);
 
-            return new RecordResult(
+            return [new RecordResult(
                 entityType: "custom:{$entry->name}",
                 sourceId: $sourceId,
                 targetId: null,
                 status: SyncStatus::Failed,
                 errorMessage: $e->getMessage(),
-            );
+            ), false];
         }
     }
 
@@ -651,7 +712,7 @@ final class BatchSync
         \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
         string $sourceId,
         array $crmRecord,
-    ): void {
+    ): bool {
         $writeBackMapping = new MappingCollection($entry->source, 'id', $entry->writeBack);
         $crmEntity = new GenericEntity(
             isset($crmRecord['id']) ? (string) $crmRecord['id'] : null,
@@ -661,18 +722,25 @@ final class BatchSync
 
         $mapped = $this->fieldMapper->map($crmEntity, $writeBackMapping, SyncDirection::CrmToCc, $this->relationMaps);
         if ($mapped === []) {
-            return;
+            return false;
         }
 
-        match ($entry->source) {
-            \Daktela\CrmSync\Config\CustomEntitySyncConfig::TARGET_CONTACT
-                => $this->ccAdapter->updateContact($sourceId, Contact::fromArray($mapped)),
-            \Daktela\CrmSync\Config\CustomEntitySyncConfig::TARGET_ACCOUNT
-                => $this->ccAdapter->updateAccount($sourceId, \Daktela\CrmSync\Entity\Account::fromArray($mapped)),
-            default => $this->logger->warning('write_back not supported for source "{source}"', [
-                'source' => $entry->source,
-            ]),
-        };
+        switch ($entry->source) {
+            case \Daktela\CrmSync\Config\CustomEntitySyncConfig::TARGET_CONTACT:
+                $this->ccAdapter->updateContact($sourceId, Contact::fromArray($mapped));
+
+                return true;
+            case \Daktela\CrmSync\Config\CustomEntitySyncConfig::TARGET_ACCOUNT:
+                $this->ccAdapter->updateAccount($sourceId, \Daktela\CrmSync\Entity\Account::fromArray($mapped));
+
+                return true;
+            default:
+                $this->logger->warning('write_back not supported for source "{source}"', [
+                    'source' => $entry->source,
+                ]);
+
+                return false;
+        }
     }
 
     /**
