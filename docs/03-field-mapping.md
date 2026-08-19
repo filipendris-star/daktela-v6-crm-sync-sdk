@@ -22,6 +22,50 @@ mappings:
       resolve_to: name
 ```
 
+## Per-Activity-Type Rules (`default` / `types`)
+
+Activity mapping files support a structured form: shared rules under
+`default:`, per-type overrides under `types:` keyed by activity type
+(`call`, `sms`, `email`, ...). Use either this structure or the legacy
+top-level `mappings:` — not both. Empty keys (`mappings: {}`, `default: {}`)
+emitted by config UIs are tolerated and treated as absent.
+
+```yaml
+entity: activity
+lookup_field: externalId
+default:
+  mappings:
+    - { cc_field: name, crm_field: externalId }
+    - { cc_field: title, crm_field: subject }
+types:
+  call:
+    mappings:
+      - cc_field: item_call_state
+        crm_field: done
+        transformers:
+          - { name: value_map, params: { map: { in_missed: 0 }, default: 1 } }
+  sms:
+    mappings:
+      - { cc_field: item_text, crm_field: note }
+```
+
+**Merge semantics** (`MappingCollection::forType()`): a non-append type rule
+*replaces* the non-append default rule targeting the same output field, in
+place; anything else is appended. `append: true` rules are never deduped —
+they exist to accumulate several values into one field, so both default and
+type append rules always survive the merge. Types without rules (and unknown
+types) get the default rules unchanged.
+
+**Flattened activity fields.** The Daktela adapter flattens each activity's
+nested relations so rules can address them as scalars: `user_email`,
+`user_login`, `user_title`, `contact_name`, and `item_<field>` for every
+scalar field of the type-specific item record (`item_direction`,
+`item_answered`, `item_text`, ...). For call activities it also derives
+**`item_call_state`** from direction + answered — one token
+(`out_answered`, `out_noanswer`, `in_answered`, `in_missed`,
+`internal_answered`, `internal_noanswer`) that a single `value_map` can turn
+into a CRM `done` flag or subject, which two separate fields cannot express.
+
 ## Direction
 
 Sync direction is configured at the **entity level** in `sync.yaml`, not per field. All field mappings within an entity follow the entity's direction. The mapping engine automatically reads from the correct side based on direction:
@@ -165,7 +209,8 @@ $engine->syncContactsBatch(); // Resolves account references; auto-syncs missing
 ## Built-in Transformers
 
 ### `date_format`
-Converts between date formats using PHP's `DateTimeImmutable`.
+Converts between date formats using PHP's `DateTimeImmutable`, with optional
+timezone conversion.
 
 ```yaml
 transformers:
@@ -173,9 +218,36 @@ transformers:
     params:
       from: "Y-m-d H:i:s"   # Source format
       to: "c"                # Target format (ISO 8601)
+      from_tz: "Europe/Prague"  # Optional: timezone the input wall-time is in
+                                # (default: the process/instance timezone)
+      to_tz: "UTC"              # Optional: convert to this zone before formatting
 ```
 
 If the source value doesn't match the `from` format, the transformer attempts generic parsing as a fallback.
+
+**Timezone conversion.** The Daktela v6 API returns naive local datetimes. When
+the target CRM interprets times as UTC (e.g. Pipedrive `due_date`/`due_time`),
+set `to_tz: UTC` so the instant is shifted before formatting — otherwise
+activities land offset by the local UTC offset. Named zones handle DST per
+date: a Prague summer time converts at +2 h, a winter time at +1 h.
+
+```yaml
+# Pipedrive due_date/due_time from one CC timestamp — both convert as one instant
+- cc_field: time
+  crm_field: due_date
+  transformers:
+    - { name: date_format, params: { from: 'Y-m-d H:i:s', to: 'Y-m-d', to_tz: 'UTC' } }
+- cc_field: time
+  crm_field: due_time
+  transformers:
+    - { name: date_format, params: { from: 'Y-m-d H:i:s', to: 'H:i', to_tz: 'UTC' } }
+```
+
+Fields the `from` format leaves unspecified are anchored to zero (not filled
+from the current time). `to_tz` only applies when the `from` format carries
+time-of-day (`H`/`G`/`h`/`g`/`i`/`s`/`v`/`u`/`U`): a date is not an instant, so for
+date-only formats the conversion is skipped and the date passes through
+unshifted instead of moving a day backward east of UTC.
 
 ### `phone_normalize`
 Strips all non-digit/non-plus characters and optionally prepends `+` for E.164 format.
@@ -261,6 +333,20 @@ transformers:
 ```
 
 Example: `"crm_12345"` → `"12345"`. If the value doesn't start with the prefix, it is returned unchanged.
+
+### `value_map`
+Maps discrete input values to configured outputs. YAML keys are strings —
+booleans match as `"true"`/`"false"`, null as `"null"`. Without `default`,
+unmatched input passes through unchanged.
+
+```yaml
+# Derive Pipedrive activity "done" from the derived call state:
+transformers:
+  - name: value_map
+    params:
+      map: { in_missed: 0 }   # missed inbound call → open/overdue task
+      default: 1              # everything else → completed
+```
 
 ### `wrap_array`
 Wraps a scalar value in an array. Already-array values are returned as-is, null/empty values become `[]`. Useful when Daktela expects array custom fields but the CRM provides a single value.

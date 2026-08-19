@@ -55,6 +55,9 @@ Each entity type (`contact`, `account`, `activity`) can be configured independen
 | `direction` | string | `crm_to_cc`, `cc_to_crm`, or `bidirectional` |
 | `mapping_file` | string | Path to YAML mapping file (relative to config dir) |
 | `activity_types` | array | For activities only: which types to sync |
+| `activity_type_map` | map | For activities only: CC type → CRM activity type key (supports CRM-side custom types, e.g. `sms: sms`); validated here, applied by the CRM adapter |
+| `link_deal` | string | For activities only: deal-linking strategy (e.g. `latest_open`) — requires an adapter implementing `SupportsDealLinkingInterface` |
+| `initial_sync` | string | `now` (default) — first run seeds the cursor and skips history; `everything` — first run exports all historical records |
 | `auto_create_contact` | object | Auto-create a contact from account data (see [Sync Engine](05-sync-engine.md#auto-create-contact-from-account)) |
 
 ### Activity Types
@@ -70,6 +73,42 @@ Available activity types for the `activity_types` config:
 | `fbm` | Facebook Messenger |
 | `wap` | WhatsApp |
 | `vbr` | Viber |
+
+### `sync.custom_entities[]`
+
+Optional list of extra sync slots for arbitrary CRM-side resources (the
+`target` is adapter-interpreted, e.g. a REST path). `cc_to_crm` entries need an
+adapter implementing `SupportsCustomEntityWriteInterface`.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | Unique slot name (required) |
+| `enabled` | bool | Default `false` |
+| `direction` | string | `crm_to_cc` or `cc_to_crm` (required) |
+| `source` | string | CC-side entity (`contact`, `account`) (required) |
+| `target` | string | CRM-side resource name/path (required) |
+| `mapping_file` | string | Mapping file for the slot |
+| `initial_sync` | string | `now` (default) or `everything` |
+| `export_filter` | list | `{field, operator, value}` conditions selecting which CC records export |
+| `write_back` | list | Inline mapping rules applied CRM→CC after create (typically stamps the prefixed CRM id back, which removes the record from the export filter) |
+
+```yaml
+sync:
+  custom_entities:
+    - name: contact_export
+      enabled: true
+      direction: cc_to_crm
+      source: contact
+      target: persons
+      mapping_file: mappings/contact_export.yaml
+      export_filter:
+        - { field: name, operator: notlike, value: 'pipedrive_person_%' }
+      write_back:
+        - cc_field: name
+          crm_field: id
+          transformers:
+            - { name: prefix, params: { value: pipedrive_person_ } }
+```
 
 ### `webhook`
 | Key | Type | Description |

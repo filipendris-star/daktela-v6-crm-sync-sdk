@@ -225,6 +225,39 @@ final class SalesforceCrmAdapter implements CrmAdapterInterface
 }
 ```
 
+## Optional Capability Interfaces
+
+Beyond `CrmAdapterInterface`, an adapter can opt into extra behavior by
+implementing capability interfaces. The engine feature-detects them with
+`instanceof` — adapters that don't implement one keep the default path.
+
+### `SupportsCursorPaginationInterface`
+
+For CRMs whose list APIs paginate by an opaque cursor (HubSpot `after`,
+Pipedrive v2 `cursor`, K2 `NextPageURL`) instead of a numeric offset.
+Implement `fetchContactsPage()` / `fetchAccountsPage()` returning a
+`CursorPage(records, nextCursor)`. The engine persists `nextCursor` in the
+sync state between runs, so an interrupted drain resumes instead of
+restarting. Return `nextCursor: null` on the last page — that (or an empty
+page) is what ends the drain; a short page alone does not, because filtered
+searches legitimately return fewer rows than the limit mid-drain.
+
+### `SupportsCustomEntityWriteInterface`
+
+Required for `cc_to_crm` custom entity export (e.g. exporting CC-born
+contacts as CRM persons). Implement `createCustomEntity()` /
+`updateCustomEntity()`; both return the resulting CRM record as a flat array
+including its `id` so the engine can run identity write-back against the
+source record. Adapters without it should use the shared
+`UnsupportedCustomEntityTrait`, which throws a clear `NotSupportedException`
+per sync slot instead of silently no-op'ing.
+
+### `SupportsDealLinkingInterface`
+
+Lets the engine link an exported activity to a CRM deal per the entity
+config's `link_deal` strategy (e.g. `latest_open`). Implement
+`linkActivityToDeal(Activity $activity, string $strategy): Activity`.
+
 ## Read-Only Adapters (No Activity Support)
 
 If your CRM/ERP doesn't have an activity API (e.g., e-commerce platforms, invoicing systems), throw `NotSupportedException` from all activity methods. The `daktela-crm-integrations` package provides a `ReadOnlyActivityTrait` that does this automatically:

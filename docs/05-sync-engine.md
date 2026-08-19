@@ -290,6 +290,40 @@ Use cases:
 
 The force flag is temporary — it only applies to that single `fullSync()` call. Subsequent calls resume incremental behavior.
 
+The flag resets both incremental inputs: the per-entity `lastSyncTime` **and**
+any persisted pagination cursor (a cursor-paginated adapter would otherwise
+resume mid-drain from a stale token instead of starting over).
+
+## Activity Export Idempotency Ledger
+
+Most CRMs cannot search activities server-side, so the usual find-then-upsert
+dedup does not work for `cc_to_crm` activity export. The engine accepts a
+host-supplied ledger that answers "was this CC activity already exported?"
+— typically backed by a database table on the host side:
+
+```php
+use Daktela\CrmSync\State\SyncLedgerInterface;
+
+final class DbLedger implements SyncLedgerInterface
+{
+    public function hasSynced(string $entityType, string $ccId): bool { /* SELECT ... */ }
+    public function recordSynced(string $entityType, string $ccId, ?string $crmId): void { /* INSERT ... */ }
+}
+
+$engine->setLedger(new DbLedger());
+```
+
+Behavior when a ledger is set:
+
+- an activity the ledger already knows is reported as `Skipped` — no CRM call;
+- new activities are **created directly** (no CRM-side lookup — the ledger owns dedup);
+- the pair is recorded after a successful create, with the resulting CRM id;
+- failed exports are *not* recorded, so the next run retries them.
+
+Without a ledger, activity export falls back to the adapter's
+`upsertActivity()` lookup-then-write path. Re-runs and forced full re-syncs
+never duplicate activities as long as the ledger persists.
+
 ## Reset State
 
 Clear saved timestamps so the next run starts from scratch:
