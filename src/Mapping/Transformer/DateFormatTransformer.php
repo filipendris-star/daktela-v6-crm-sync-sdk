@@ -65,6 +65,14 @@ final class DateFormatTransformer implements ValueTransformerInterface
             } catch (\Exception) {
                 return $value;
             }
+
+            // The date-only rule above keys on the configured format, but this
+            // path accepted a value the format did not describe: re-apply the
+            // rule to the value itself, or a date-only value slipping through a
+            // datetime format would still shift by a whole day.
+            if ($toTz !== null && preg_match('/\d{1,2}:\d{2}/', (string) $value) !== 1) {
+                $toTz = null;
+            }
         }
 
         if ($toTz !== null) {

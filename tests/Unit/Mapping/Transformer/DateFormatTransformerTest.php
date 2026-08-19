@@ -165,4 +165,31 @@ final class DateFormatTransformerTest extends TestCase
 
         self::assertSame('2026-08-19 00:00:00', $result);
     }
+
+    public function testDateOnlyValueViaFallbackParseIgnoresToTz(): void
+    {
+        // Mixed-format source data: the configured format carries time, but this
+        // value doesn't and reaches the generic fallback parser. The date-only
+        // rule must apply to the value too, or it shifts by a whole day.
+        $result = $this->transformer->transform('2024-06-01', [
+            'from' => 'Y-m-d H:i:s',
+            'to' => 'Y-m-d',
+            'from_tz' => 'Europe/Prague',
+            'to_tz' => 'UTC',
+        ]);
+
+        self::assertSame('2024-06-01', $result);
+    }
+
+    public function testFallbackParseStillConvertsWhenValueCarriesTime(): void
+    {
+        $result = $this->transformer->transform('2024-06-01T14:30:00', [
+            'from' => 'Y-m-d H:i:s',
+            'to' => 'H:i',
+            'from_tz' => 'Europe/Prague',
+            'to_tz' => 'UTC',
+        ]);
+
+        self::assertSame('12:30', $result);
+    }
 }
