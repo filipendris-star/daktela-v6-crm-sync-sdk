@@ -301,8 +301,11 @@ final class BatchSync
         // CC history is almost never intended. Opt out with `initial_sync: everything`,
         // or use forceFullSync for an explicit one-off historical push.
         if ($since === null && !$this->forceFullSync && $this->stateStore !== null) {
+            // Only a *configured* activity entity opts into the seeding rail. A
+            // direct programmatic call without config passed explicit types and
+            // expects an export — silently seeding-and-skipping would surprise it.
             $activityConfig = $this->config->getEntityConfig('activity');
-            if ($activityConfig === null || $activityConfig->initialSync === 'now') {
+            if ($activityConfig !== null && $activityConfig->initialSync === 'now') {
                 $seed = new \DateTimeImmutable();
                 $this->stateStore->setLastSyncTime('activity', $seed);
                 $this->logger->info('Activity sync has no cursor — seeding to now; historical activities are not pushed (initial_sync: now)', [

@@ -173,4 +173,50 @@ final class BatchSyncInitialSyncTest extends TestCase
     {
         yield from $items;
     }
+
+    public function testUnconfiguredActivityEntityDoesNotSeed(): void
+    {
+        // A direct syncActivities() call without an 'activity' entity config
+        // passed explicit types and expects an export — the seeding rail must
+        // only engage for configured entities, not silently skip everything.
+        $activity = Activity::fromArray(['id' => 'call-1', 'name' => 'c1', 'title' => 'Old call']);
+        $activity->setActivityType(ActivityType::Call);
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('iterateActivities')->willReturn($this->gen([$activity]));
+
+        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
+        $crmAdapter->method('upsertActivity')->willReturn(Activity::fromArray(['id' => 'crm-1']));
+
+        $stateStore = $this->createMock(SyncStateStoreInterface::class);
+        $stateStore->method('getLastSyncTime')->willReturn(null);
+        $stateStore->expects(self::never())->method('setLastSyncTime');
+
+        $config = new SyncConfiguration(
+            instanceUrl: 'https://test.daktela.com',
+            accessToken: 'test-token',
+            database: 'test-db',
+            batchSize: 100,
+            entities: [],
+            mappings: [
+                'activity' => new MappingCollection('activity', 'name', [
+                    new FieldMapping('name', 'external_id'),
+                    new FieldMapping('title', 'subject'),
+                ]),
+            ],
+        );
+
+        $batchSync = new BatchSync(
+            $ccAdapter,
+            $crmAdapter,
+            new FieldMapper(TransformerRegistry::withDefaults()),
+            $config,
+            new NullLogger(),
+            $stateStore,
+        );
+
+        $result = $batchSync->syncActivities([ActivityType::Call]);
+
+        self::assertSame(1, $result->getTotalCount(), 'unconfigured entity must export, not seed-and-skip');
+    }
 }
