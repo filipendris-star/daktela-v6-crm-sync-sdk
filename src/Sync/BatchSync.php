@@ -570,6 +570,7 @@ final class BatchSync
         $offset = $this->offsets[$offsetKey] ?? 0;
         $count = 0;
         $stillMatching = 0;
+        $departedCount = 0;
         $firstId = null;
         $exhausted = true;
         // Cap one export batch at the CC adapter's page size (read from the
@@ -596,6 +597,8 @@ final class BatchSync
             // depart (write-back needs a source id), so they always consume offset.
             if (!$departed) {
                 $stillMatching++;
+            } else {
+                $departedCount++;
             }
 
             $count++;
@@ -636,8 +639,8 @@ final class BatchSync
         // is not touching a field the export_filter checks, so the rows keep
         // re-entering the window (their `edited` was just bumped) and would be
         // re-exported on every run forever.
-        if ($exhausted && $entry->writeBack !== [] && $count > 0
-            && $stillMatching === $count && $result->getFailedCount() === 0) {
+        $succeeded = $count - $result->getFailedCount();
+        if ($exhausted && $entry->writeBack !== [] && $succeeded > 0 && $departedCount === 0) {
             $this->logger->error(
                 'Custom entity "{name}" write_back left every exported record inside export_filter — fix the write_back/export_filter pairing',
                 ['name' => $entry->name],
