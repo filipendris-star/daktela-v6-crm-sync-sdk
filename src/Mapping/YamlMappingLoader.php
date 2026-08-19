@@ -56,7 +56,9 @@ final class YamlMappingLoader
             $typeMappings = [];
         } else {
             $base = [];
-            if (isset($data['default'])) {
+            // Same tolerance as the top-level checks: an empty `default:` ({} / [])
+            // emitted by the UI is treated as absent, not as a malformed section.
+            if (!empty($data['default'])) {
                 if (!is_array($data['default']) || !is_array($data['default']['mappings'] ?? null)) {
                     throw ConfigurationException::invalidMappingFile(
                         $filePath,
@@ -67,7 +69,7 @@ final class YamlMappingLoader
             }
 
             $typeMappings = [];
-            if (isset($data['types'])) {
+            if (!empty($data['types'])) {
                 if (!is_array($data['types'])) {
                     throw ConfigurationException::invalidMappingFile($filePath, '"types" must be a map of type => rules');
                 }

@@ -97,4 +97,30 @@ final class YamlMappingLoaderTest extends TestCase
 
         self::assertCount(5, $collection->mappings);
     }
+
+    public function testEmptyDefaultAlongsidePopulatedTypesLoads(): void
+    {
+        // The UI can emit an empty `default:` next to populated `types:` — that
+        // must load with no base rules, mirroring the top-level empty-`mappings:`
+        // tolerance, not throw '"default" must contain a "mappings" list'.
+        $tmpFile = tempnam(sys_get_temp_dir(), 'mapping_') . '.yaml';
+        file_put_contents($tmpFile, <<<YAML
+            entity: activity
+            lookup_field: externalId
+            default: {}
+            types:
+              call:
+                mappings:
+                  - { cc_field: item_answered, crm_field: done }
+            YAML);
+
+        try {
+            $collection = (new YamlMappingLoader())->load($tmpFile);
+        } finally {
+            unlink($tmpFile);
+        }
+
+        self::assertSame([], $collection->mappings);
+        self::assertCount(1, $collection->forType('call')->mappings);
+    }
 }
