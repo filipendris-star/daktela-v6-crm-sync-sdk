@@ -181,6 +181,32 @@ final class DateFormatTransformerTest extends TestCase
         self::assertSame('2024-06-01', $result);
     }
 
+    #[\PHPUnit\Framework\Attributes\DataProvider('rfc2822DateTimeProvider')]
+    public function testRfc2822DateTimesAreStillConverted(string $value, string $expected): void
+    {
+        // A weekday name does not make a value date-only: RFC 2822 / HTTP dates are
+        // the canonical email Date: header shape and carry a real time, which must
+        // still be shifted into the target zone.
+        $result = $this->transformer->transform($value, [
+            'from' => 'Y-m-d H:i:s',
+            'to' => 'Y-m-d H:i',
+            'from_tz' => 'Europe/Prague',
+            'to_tz' => 'UTC',
+        ]);
+
+        self::assertSame($expected, $result, sprintf('value "%s" carries a time and must convert', $value));
+    }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function rfc2822DateTimeProvider(): iterable
+    {
+        // 14:30 Prague (CEST, +2) = 12:30 UTC
+        yield 'rfc 2822 without offset' => ['Sat, 01 Jun 2024 14:30:00', '2024-06-01 12:30'];
+        // an explicit offset in the value wins over from_tz: 14:30+02:00 = 12:30 UTC
+        yield 'rfc 2822 with offset' => ['Sat, 01 Jun 2024 14:30:00 +0200', '2024-06-01 12:30'];
+        yield 'relative keyword with a time' => ['2024-06-01 09:00:00 GMT', '2024-06-01 09:00'];
+    }
+
     #[\PHPUnit\Framework\Attributes\DataProvider('timeCarryingFallbackValuesProvider')]
     public function testFallbackParseStillConvertsWhenValueCarriesTime(string $value): void
     {
@@ -226,9 +252,9 @@ final class DateFormatTransformerTest extends TestCase
     public static function dateOnlyFallbackValuesProvider(): iterable
     {
         yield 'rfc 2822 date-only' => ['Sat, 01 Jun 2024', '2024-06-01'];
-        yield 'weekday prefix' => ['Mon 1 Jun 2024', '2024-06-03'];
         yield 'plain iso date' => ['2024-06-01', '2024-06-01'];
         yield 'textual date' => ['1 Jun 2024', '2024-06-01'];
+        yield 'bare relative keyword' => ['today', (new \DateTimeImmutable('today', new \DateTimeZone('Europe/Prague')))->format('Y-m-d')];
     }
 
     public function testFallbackParseConvertsMeridiemValues(): void

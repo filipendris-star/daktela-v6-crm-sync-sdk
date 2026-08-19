@@ -72,12 +72,10 @@ final class DateFormatTransformer implements ValueTransformerInterface
             // datetime format would still shift by a whole day.
             //
             // date_parse reports what it actually parsed, so compact ISO
-            // ("20240601T143000"), "2pm" and "14.30" are recognised as carrying a
-            // time — but it also sets hour = 0 as a side effect of a relative
-            // token, which is why "Sat, 01 Jun 2024" (RFC 2822 date-only) and
-            // "yesterday" must be excluded via the `relative` key. Known limits:
-            // an explicit "midnight" and the bare keyword "today" are treated as
-            // instants.
+            // ("20240601T143000"), "2pm", "14.30" and RFC 2822 datetimes
+            // ("Sat, 01 Jun 2024 14:30:00" — the standard email Date: header) are
+            // all recognised as carrying a time, while date-only values in any of
+            // those notations are not.
             if ($toTz !== null && !$this->valueCarriesTime((string) $value)) {
                 $toTz = null;
             }
@@ -91,15 +89,25 @@ final class DateFormatTransformer implements ValueTransformerInterface
     }
 
     /**
-     * True when the VALUE itself parsed a time of day. `hour` alone is not enough:
-     * a relative token (weekday name, "yesterday", "next monday") sets it to 0
-     * without any time being present.
+     * True when the VALUE itself parsed a time of day.
+     *
+     * `hour !== false` alone is not enough: date_parse sets hour/minute/second to
+     * 0 for a value that names only a date ("Sat, 01 Jun 2024", "today"). An
+     * all-zero time therefore means "no time was given" — the one value it
+     * misreads is an explicit midnight, which reaches this path only when it did
+     * not match the configured format, and treating it as a date is the safer
+     * reading anyway (no date can shift).
      */
     private function valueCarriesTime(string $value): bool
     {
         $parsed = date_parse($value);
+        $hour = $parsed['hour'] ?? false;
 
-        return ($parsed['hour'] ?? false) !== false && empty($parsed['relative']);
+        if ($hour === false) {
+            return false;
+        }
+
+        return $hour !== 0 || ($parsed['minute'] ?? 0) !== 0 || ($parsed['second'] ?? 0) !== 0;
     }
 
     /**
