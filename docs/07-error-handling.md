@@ -129,7 +129,39 @@ $record->errorMessage;  // Error details (null if successful)
 
 ## fullSync() Error Handling
 
-When using `fullSync()`, each entity type has its own `SyncResult`. A failure in account sync does not prevent contact sync from running:
+When using `fullSync()`, each entity type has its own `SyncResult`. A failure in
+one entity does not prevent independent entities from running — but entities that
+*depend* on a failed one are skipped rather than run against state it never
+produced (contacts resolve account references through the relation maps the
+account step builds, so a failed account step skips contacts, activities and
+custom entities).
+
+Two failure levels exist and they need different handling:
+
+- **per-record** failures — `$result->getFailedCount()`, individual records the
+  other records' success is unaffected by. The entity's sync window still
+  advances (unless *every* record failed).
+- **step-level** failures — `$results->stepFailures` (entity type => message),
+  a whole step that failed or was skipped: an adapter fault, a misconfiguration,
+  or a skipped dependent. The step's sync window is deliberately **not** advanced,
+  so nothing edited during the outage falls out of the incremental window.
+
+`fullSync()` returns normally even when steps failed, so a scheduler must check
+`hasStepFailures()` — otherwise a total outage looks like a successful run:
+
+```php
+$results = $engine->fullSync();
+
+if ($results->hasStepFailures()) {
+    foreach ($results->stepFailures as $entityType => $error) {
+        $logger->error('{type} sync step failed: {error}', ['type' => $entityType, 'error' => $error]);
+    }
+
+    exit(1); // the run did not sync everything it was asked to
+}
+```
+
+Per-record failures are reported per entity:
 
 ```php
 $results = $engine->fullSync();

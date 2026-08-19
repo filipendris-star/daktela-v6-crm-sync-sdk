@@ -236,6 +236,33 @@ final class FullSyncTest extends TestCase
         );
     }
 
+
+    public function testFailedAccountStepGatesContactsInsteadOfWritingRawCrmIds(): void
+    {
+        // Contacts resolve account references through the relation maps step 1
+        // builds. If step 1 blew up and step 3 ran anyway, the resolver would fall
+        // back to the raw CRM foreign key, write it into Daktela, report failed=0
+        // and advance the contact watermark — a permanent wrong link.
+        $crm = new FailingAccountsCrmAdapter(
+            contacts: [Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@t.com', 'company_id' => 'crm-a9'])],
+        );
+        $cc = new FakeCcAdapter();
+
+        $results = $this->engine($crm, $cc)->fullSync();
+
+        self::assertTrue($results->hasStepFailures(), 'the run must not look successful');
+        self::assertArrayHasKey('account', $results->stepFailures);
+        self::assertArrayHasKey('contact', $results->stepFailures, 'the dependent step is reported too');
+        self::assertSame([], $cc->contacts, 'no contact may be written without resolved relations');
+
+        // Nothing was saved at all — the file may not even exist.
+        $state = is_file($this->stateFile)
+            ? (array) json_decode((string) file_get_contents($this->stateFile), true)
+            : [];
+        self::assertArrayNotHasKey('contact', $state, 'the gated step must not advance its watermark');
+        self::assertArrayNotHasKey('account', $state);
+    }
+
     private function engine(
         FakeCrmAdapter $crm,
         FakeCcAdapter $cc,
@@ -281,5 +308,15 @@ final class FullSyncTest extends TestCase
             logger: new NullLogger(),
             stateStore: new FileSyncStateStore($this->stateFile),
         );
+    }
+}
+
+/** CRM whose account listing fails (503, revoked scope, …) while contacts are fine. */
+final class FailingAccountsCrmAdapter extends FakeCrmAdapter
+{
+    public function iterateAccounts(?\DateTimeImmutable $since = null, int $offset = 0): \Generator
+    {
+        throw new \RuntimeException('CRM /organizations returned 503');
+        yield from []; // @phpstan-ignore-line unreachable, keeps this a Generator
     }
 }

@@ -8,6 +8,11 @@ final readonly class FullSyncResult
 {
     /**
      * @param array<string, SyncResult> $customEntities keyed by CustomEntitySyncConfig::$name
+     * @param array<string, string> $stepFailures entity type => error message, for steps that
+     *        failed or were skipped as a whole (an adapter fault or misconfiguration, as opposed
+     *        to individual records failing). A run with any of these did NOT sync everything it
+     *        was asked to, even though it returned normally — schedulers should treat it as a
+     *        failed run.
      */
     public function __construct(
         public ?SyncResult $account = null,
@@ -15,7 +20,14 @@ final readonly class FullSyncResult
         public ?SyncResult $contact = null,
         public ?SyncResult $activity = null,
         public array $customEntities = [],
+        public array $stepFailures = [],
     ) {
+    }
+
+    /** True when at least one whole step failed or was skipped; see $stepFailures. */
+    public function hasStepFailures(): bool
+    {
+        return $this->stepFailures !== [];
     }
 
     /**

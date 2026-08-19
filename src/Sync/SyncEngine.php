@@ -25,6 +25,9 @@ final class SyncEngine
 
     private readonly WebhookSync $webhookSync;
 
+    /** @var array<string, string> Step-level failures of the current fullSync(), entity type => message */
+    private array $stepFailures = [];
+
     public function __construct(
         private readonly ContactCentreAdapterInterface $ccAdapter,
         private readonly CrmAdapterInterface $crmAdapter,
@@ -55,26 +58,26 @@ final class SyncEngine
     }
 
     /**
-     * Inject a host-supplied idempotency ledger (e.g. a DB-backed store) used to
-     * dedupe one-way exports the CRM cannot search server-side (activities).
-     * When unset, exports fall back to the adapter's own upsert/lookup.
-     */
-    /**
-     * Run one entity's drain in isolation. A step that throws (adapter fault,
-     * misconfiguration) must not abort the other steps — the documented contract
-     * is that a failure in one entity does not prevent the others from running —
-     * and its watermark must NOT be saved, so nothing edited during the outage
-     * falls out of the incremental window. The failure is recorded in that step's
-     * result so the caller still sees it in FullSyncResult.
+     * Run one entity's drain, contained. A step that throws (adapter fault,
+     * misconfiguration) must not abort sibling steps, and its watermark must NOT
+     * be saved — nothing edited during the outage may fall out of the incremental
+     * window. The failure is recorded both on the step's own result and in
+     * $stepFailures, so neither a caller inspecting FullSyncResult nor a cron
+     * wrapper checking an exit code can mistake the run for a success.
+     *
+     * Returns false when the step failed, so steps that DEPEND on it can be
+     * gated instead of running against state it never produced.
      *
      * @param callable(): void $drain
      */
-    private function runIsolated(string $entityType, SyncResult $result, \DateTimeImmutable $syncStartTime, callable $drain): void
+    private function runIsolated(string $entityType, SyncResult $result, \DateTimeImmutable $syncStartTime, callable $drain): bool
     {
         try {
             $drain();
             $result->finish();
             $this->saveState($entityType, $syncStartTime, $result);
+
+            return true;
         } catch (\Throwable $e) {
             $this->logger->error('Sync step {entityType} failed: {error}', [
                 'entityType' => $entityType,
@@ -82,9 +85,33 @@ final class SyncEngine
             ]);
             $result->addRecord(new RecordResult($entityType, null, null, SyncStatus::Failed, $e->getMessage()));
             $result->finish();
+            $this->stepFailures[$entityType] = $e->getMessage();
+
+            return false;
         }
     }
 
+    /**
+     * Mark a step as not run because a step it depends on failed. No watermark is
+     * saved, so the skipped window is re-covered once the dependency recovers.
+     */
+    private function skipDependentStep(string $entityType, SyncResult $result, string $dependency): void
+    {
+        $message = sprintf('skipped: the %s step it depends on failed', $dependency);
+        $this->logger->error('Sync step {entityType} {message}', [
+            'entityType' => $entityType,
+            'message' => $message,
+        ]);
+        $result->addRecord(new RecordResult($entityType, null, null, SyncStatus::Failed, $message));
+        $result->finish();
+        $this->stepFailures[$entityType] = $message;
+    }
+
+    /**
+     * Inject a host-supplied idempotency ledger (e.g. a DB-backed store) used to
+     * dedupe one-way exports the CRM cannot search server-side (activities).
+     * When unset, exports fall back to the adapter's own upsert/lookup.
+     */
     public function setLedger(?SyncLedgerInterface $ledger): void
     {
         $this->batchSync->setLedger($ledger);
@@ -106,12 +133,16 @@ final class SyncEngine
         ?callable $onBatch = null,
     ): FullSyncResult {
         $this->batchSync->setForceFullSync($forceFullSync);
+        $this->stepFailures = [];
 
         try {
             $accountResult = null;
             $autoContactResult = null;
             $contactResult = null;
             $activityResult = null;
+            // No account step to depend on (entity disabled) is not a failure:
+            // step 2 builds the relation maps directly in that case.
+            $accountStepOk = true;
 
             // Step 1: Sync accounts first (builds relation maps)
             if ($this->config->isEntityEnabled('account')) {
@@ -120,7 +151,7 @@ final class SyncEngine
                 $syncStartTime = new \DateTimeImmutable();
                 $accountResult = new SyncResult();
                 $autoContactResult = new SyncResult();
-                $this->runIsolated('account', $accountResult, $syncStartTime, function () use (&$accountResult, &$autoContactResult, $onBatch): void {
+                $accountStepOk = $this->runIsolated('account', $accountResult, $syncStartTime, function () use (&$accountResult, &$autoContactResult, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncAccounts();
                         if ($onBatch !== null) {
@@ -148,6 +179,14 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $contactResult = new SyncResult();
+                if (!$accountStepOk) {
+                    // Contacts resolve account references through the relation maps
+                    // step 1 builds. Running now would write raw CRM foreign keys
+                    // into Daktela (the resolver falls back to the unmapped value)
+                    // and then advance the contact watermark over them — a wrong
+                    // link that no later run would ever revisit.
+                    $this->skipDependentStep('contact', $contactResult, 'account');
+                } else {
                 $this->runIsolated('contact', $contactResult, $syncStartTime, function () use (&$contactResult, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncContacts();
@@ -157,6 +196,7 @@ final class SyncEngine
                         $contactResult->mergeCounts($batch);
                     } while (!$batch->isExhausted());
                 });
+                }
             }
 
             // Step 4: Sync activities
@@ -165,6 +205,10 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $activityResult = new SyncResult();
+                if (!$accountStepOk) {
+                    // Activity mappings resolve relations through the same maps.
+                    $this->skipDependentStep('activity', $activityResult, 'account');
+                } else {
                 $this->runIsolated('activity', $activityResult, $syncStartTime, function () use (&$activityResult, $activityTypes, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncActivities($activityTypes);
@@ -174,6 +218,7 @@ final class SyncEngine
                         $activityResult->mergeCounts($batch);
                     } while (!$batch->isExhausted());
                 });
+                }
             }
 
             // Step 5: Sync configured custom entities. Runs after typed slots so relation maps
@@ -197,6 +242,12 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $entryResult = new SyncResult();
+                if (!$accountStepOk) {
+                    // Custom entity mappings resolve relations through the same maps.
+                    $this->skipDependentStep("custom:{$customEntry->name}", $entryResult, 'account');
+                    $customEntityResults[$customEntry->name] = $entryResult;
+                    continue;
+                }
                 $this->runIsolated("custom:{$customEntry->name}", $entryResult, $syncStartTime, function () use (&$entryResult, $customEntry, $mapping, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncCustomEntity($customEntry, $mapping);
@@ -215,6 +266,7 @@ final class SyncEngine
                 $contactResult,
                 $activityResult,
                 $customEntityResults,
+                $this->stepFailures,
             );
         } finally {
             $this->batchSync->setForceFullSync(false);
