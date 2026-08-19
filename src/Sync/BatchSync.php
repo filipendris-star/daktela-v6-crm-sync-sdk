@@ -111,7 +111,11 @@ final class BatchSync
 
         $result->setExhausted($exhausted);
         $this->cursors[$key] = $next;
-        $this->stateStore?->setCursor($key, $next);
+        // A forced full drain runs with since = null, so its mid-drain tokens are
+        // bound to that query — persisting one would make an interrupted forced
+        // run's token resume a *normal* (since-bound) run in the wrong window.
+        // Persist only the clear; the in-run cursor still drives forced paging.
+        $this->stateStore?->setCursor($key, $this->forceFullSync ? null : $next);
     }
 
     /**

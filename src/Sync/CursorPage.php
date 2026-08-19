@@ -6,9 +6,10 @@ namespace Daktela\CrmSync\Sync;
 
 /**
  * One page of records from a cursor-paginated adapter, plus the token to fetch
- * the next page. Exhaustion is signalled by the caller comparing count($records)
- * against the requested limit (a short page = the end), so adapters don't have to
- * reason about it — they just hand back whatever the API's "next" token was.
+ * the next page. The drain ends when `nextCursor` is null (or a page is empty) —
+ * a short page alone does NOT signal the end, since filtered searches can return
+ * fewer rows than the limit mid-drain. Adapters just hand back whatever the
+ * API's "next" token was, and null on the last page.
  *
  * @template T
  */

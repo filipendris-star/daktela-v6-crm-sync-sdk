@@ -29,7 +29,9 @@ final class BatchSyncCursorPaginationTest extends TestCase
 
     protected function setUp(): void
     {
-        $this->stateFile = tempnam(sys_get_temp_dir(), 'cursor_state_') . '.json';
+        $base = tempnam(sys_get_temp_dir(), 'cursor_state_');
+        $this->stateFile = $base . '.json';
+        @unlink($base); // tempnam creates the extension-less file; don't leak it
     }
 
     protected function tearDown(): void
@@ -123,6 +125,32 @@ final class BatchSyncCursorPaginationTest extends TestCase
         self::assertSame([null], $adapter->cursorsSeen, 'forced re-sync must restart the drain, not resume the stale token');
         self::assertTrue($result->isExhausted());
         self::assertNull($store->getCursor('contact'));
+    }
+
+
+    public function testForceFullSyncDoesNotPersistMidDrainTokens(): void
+    {
+        // Forced drains run with since = null; their tokens are bound to that
+        // query. Persisting one would make an interrupted forced run resume a
+        // NORMAL (since-bound) run from a wrong-window token.
+        $store = new FileSyncStateStore($this->stateFile);
+
+        $adapter = new FakeCursorCrmAdapter([
+            null => new CursorPage([$this->contact('c1'), $this->contact('c2')], 'CURSOR_P2'),
+            'CURSOR_P2' => new CursorPage([$this->contact('c3')], null),
+        ]);
+
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+        $batch->setForceFullSync(true);
+
+        $r1 = $batch->syncContacts();
+        self::assertFalse($r1->isExhausted());
+        self::assertNull($store->getCursor('contact'), 'mid-drain token must not be persisted during a forced run');
+
+        // In-run paging still works off the in-memory cursor.
+        $r2 = $batch->syncContacts();
+        self::assertTrue($r2->isExhausted());
+        self::assertSame([null, 'CURSOR_P2'], $adapter->cursorsSeen);
     }
 
     private function batchSync(CrmAdapterInterface $crm, FileSyncStateStore $store, int $batchSize): BatchSync
