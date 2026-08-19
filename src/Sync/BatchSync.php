@@ -76,24 +76,37 @@ final class BatchSync
     /**
      * Resolve the resume cursor for a cursor-paginated entity: in-run cursor first
      * (continues a drain across the engine's batch loop), else the persisted one
-     * (resumes a drain that a previous run left unfinished).
+     * (resumes a drain that a previous run left unfinished). A forced full re-sync
+     * ignores the persisted token — it promises to start over, so resuming a stale
+     * mid-drain position would skip everything before it.
      */
     private function resolveCursor(string $key): ?string
     {
-        return $this->cursors[$key] ?? $this->stateStore?->getCursor($key);
+        if (array_key_exists($key, $this->cursors)) {
+            return $this->cursors[$key];
+        }
+
+        if ($this->forceFullSync) {
+            return null;
+        }
+
+        return $this->stateStore?->getCursor($key);
     }
 
     /**
-     * Record the page outcome: a short page (rows < limit) or a null next token
-     * means the drain is complete — mark exhausted and clear the cursor so the
-     * next run starts fresh. Otherwise persist the next token (in-run + on disk)
-     * so an interrupted drain resumes instead of restarting.
+     * Record the page outcome: only a null next token (or an empty page) means the
+     * drain is complete — mark exhausted and clear the cursor so the next run
+     * starts fresh. A short page is NOT treated as exhaustion: filtered searches
+     * (e.g. HubSpot) legitimately return fewer rows than the limit while more
+     * pages remain, and ending the drain there would strand the rest outside the
+     * next incremental window. Otherwise persist the next token (in-run + on
+     * disk) so an interrupted drain resumes instead of restarting.
      *
      * @param CursorPage<mixed> $page
      */
-    private function advanceCursor(string $key, CursorPage $page, int $rows, int $limit, SyncResult $result): void
+    private function advanceCursor(string $key, CursorPage $page, int $rows, SyncResult $result): void
     {
-        $exhausted = $rows < $limit || $page->nextCursor === null;
+        $exhausted = $page->nextCursor === null || $rows === 0;
         $next = $exhausted ? null : $page->nextCursor;
 
         $result->setExhausted($exhausted);
@@ -152,7 +165,7 @@ final class BatchSync
             foreach ($page->records as $contact) {
                 $result->addRecord($this->syncEntityToCc($contact, $mapping, 'contact', $upsertFn));
             }
-            $this->advanceCursor('contact', $page, count($page->records), $limit, $result);
+            $this->advanceCursor('contact', $page, count($page->records), $result);
         } else {
             $offset = $this->offsets['contact'] ?? 0;
             $count = 0;
@@ -216,7 +229,7 @@ final class BatchSync
             foreach ($page->records as $account) {
                 $processAccount($account);
             }
-            $this->advanceCursor('account', $page, count($page->records), $limit, $result);
+            $this->advanceCursor('account', $page, count($page->records), $result);
         } else {
             $offset = $this->offsets['account'] ?? 0;
             $count = 0;

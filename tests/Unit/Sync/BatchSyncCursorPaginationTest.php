@@ -37,15 +37,18 @@ final class BatchSyncCursorPaginationTest extends TestCase
         @unlink($this->stateFile);
     }
 
-    public function testFullPageStoresCursorThenShortPageClearsIt(): void
+    public function testFullPageStoresCursorAndNullNextTokenEndsDrain(): void
     {
         $store = new FileSyncStateStore($this->stateFile);
 
         // Page 1: full (batchSize=2) → cursor persisted, not exhausted.
-        // Page 2: short (1 record) → exhausted, cursor cleared.
+        // Page 2: short (1 record) BUT with a live next token → NOT exhausted;
+        //         filtered searches (e.g. HubSpot) return short pages mid-drain.
+        // Page 3: null next token → exhausted, cursor cleared.
         $adapter = new FakeCursorCrmAdapter([
             null => new CursorPage([$this->contact('c1'), $this->contact('c2')], 'CURSOR_P2'),
             'CURSOR_P2' => new CursorPage([$this->contact('c3')], 'CURSOR_P3'),
+            'CURSOR_P3' => new CursorPage([$this->contact('c4')], null),
         ]);
 
         $batch = $this->batchSync($adapter, $store, batchSize: 2);
@@ -55,10 +58,14 @@ final class BatchSyncCursorPaginationTest extends TestCase
         self::assertSame('CURSOR_P2', $store->getCursor('contact'), 'cursor persisted after full page');
 
         $r2 = $batch->syncContacts();
-        self::assertTrue($r2->isExhausted(), 'short page is exhausted');
+        self::assertFalse($r2->isExhausted(), 'short page with a live next token must NOT end the drain');
+        self::assertSame('CURSOR_P3', $store->getCursor('contact'), 'live token persisted after short page');
+
+        $r3 = $batch->syncContacts();
+        self::assertTrue($r3->isExhausted(), 'null next token ends the drain');
         self::assertNull($store->getCursor('contact'), 'cursor cleared at end of drain');
 
-        self::assertSame([null, 'CURSOR_P2'], $adapter->cursorsSeen, 'page 2 resumed from the stored cursor');
+        self::assertSame([null, 'CURSOR_P2', 'CURSOR_P3'], $adapter->cursorsSeen, 'each page resumed from the stored cursor');
     }
 
     public function testInterruptedRunResumesFromPersistedCursor(): void
@@ -92,6 +99,29 @@ final class BatchSyncCursorPaginationTest extends TestCase
         $r = $this->batchSync($adapter, $store, batchSize: 2)->syncContacts();
 
         self::assertTrue($r->isExhausted(), 'null next cursor ends the drain');
+        self::assertNull($store->getCursor('contact'));
+    }
+
+
+    public function testForceFullSyncIgnoresPersistedCursor(): void
+    {
+        // A previous run left a mid-drain token behind. A forced full re-sync
+        // promises to start over — resuming from that stale token would skip
+        // everything before it.
+        $store = new FileSyncStateStore($this->stateFile);
+        $store->setCursor('contact', 'STALE_MID_DRAIN');
+
+        $adapter = new FakeCursorCrmAdapter([
+            null => new CursorPage([$this->contact('c1')], null),
+        ]);
+
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+        $batch->setForceFullSync(true);
+
+        $result = $batch->syncContacts();
+
+        self::assertSame([null], $adapter->cursorsSeen, 'forced re-sync must restart the drain, not resume the stale token');
+        self::assertTrue($result->isExhausted());
         self::assertNull($store->getCursor('contact'));
     }
 

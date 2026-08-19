@@ -11,8 +11,10 @@ use Daktela\CrmSync\Sync\CursorPage;
  * (HubSpot `after`, K2 NextPageURL, Pipedrive v2 `cursor`) rather than a numeric
  * offset. The engine persists the returned `nextCursor` in the sync state between
  * runs and hands it back on the next page, so an interrupted drain resumes instead
- * of restarting. The cursor is cleared (drain complete) when a page returns fewer
- * records than the requested limit.
+ * of restarting. The drain is complete when a page carries a null `nextCursor`
+ * (or no records at all) — a short page alone does NOT end it, since filtered
+ * searches (e.g. HubSpot) legitimately return fewer rows than the limit while
+ * more pages remain. Return `nextCursor: null` on the last page.
  *
  * Applies to the crm_to_cc imports (contacts, accounts) — those are read from the
  * CRM. Activities flow cc_to_crm and are read from the Contact Centre adapter, so
