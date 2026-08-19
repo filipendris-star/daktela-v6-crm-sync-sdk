@@ -107,39 +107,71 @@ final class WebhookSyncTest extends TestCase
     }
 
 
-    public function testSyncActivityStillUpdatesWhenTheLedgerAlreadyKnowsIt(): void
+    public function testMultiEventCallUpdatesOneCrmRecordWithALookupLedger(): void
     {
-        // One activity emits several webhook events (call_create → call_answer →
-        // call_close). If the ledger made the webhook path skip, the CRM record
-        // would freeze at the first event's payload (no duration, no recording)
-        // and the batch path would skip it too — permanently wrong. The ledger is
-        // for recording here, not for skipping.
+        // One call emits call_create → call_answer → call_close. On a CRM that
+        // cannot search activities (findActivityByLookup returns null — the very
+        // reason a ledger exists), upsert would CREATE on every event. With a
+        // lookup-capable ledger the follow-up events must update the record the
+        // first event created: one CRM record, three writes.
+        $ledger = new WebhookLookupLedger();
+        $crm = new RecordingActivityCrmAdapter();
+
+        $webhookSync = $this->webhookSyncFor($crm, $ledger);
+
+        foreach (['Call started', 'Call answered', 'Call closed'] as $title) {
+            $result = $webhookSync->syncActivity('call-1', ActivityType::Call);
+            self::assertSame(SyncStatus::Updated, $result->getRecords()[0]->status, $title);
+            $crm->nextTitle = $title;
+        }
+
+        self::assertCount(1, $crm->created, 'exactly one CRM activity for one call');
+        self::assertCount(2, $crm->updated, 'the two follow-up events updated it');
+        self::assertSame(['crm-1', 'crm-1'], $crm->updated, 'both updates targeted the recorded CRM id');
+        self::assertSame(1, $ledger->recordCalls, 'recorded once, not per event');
+    }
+
+    public function testMultiEventCallSkipsFollowUpsWithoutALookupLedger(): void
+    {
+        // A ledger that cannot return the CRM id has no safe way to update, so
+        // follow-up events are skipped: the payload freezes at the first event,
+        // but the CRM never gets a duplicate.
+        $ledger = new WebhookPlainLedger();
+        $crm = new RecordingActivityCrmAdapter();
+
+        $webhookSync = $this->webhookSyncFor($crm, $ledger);
+
+        $first = $webhookSync->syncActivity('call-1', ActivityType::Call);
+        $second = $webhookSync->syncActivity('call-1', ActivityType::Call);
+
+        self::assertSame(SyncStatus::Updated, $first->getRecords()[0]->status);
+        self::assertSame(SyncStatus::Skipped, $second->getRecords()[0]->status);
+        self::assertCount(1, $crm->created, 'no duplicate CRM activity');
+        self::assertCount(0, $crm->updated);
+    }
+
+    private function webhookSyncFor(RecordingActivityCrmAdapter $crm, \Daktela\CrmSync\State\SyncLedgerInterface $ledger): WebhookSync
+    {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
-        $ccAdapter->method('findActivity')->willReturn(Activity::fromArray([
-            'id' => 'call-1', 'activity_type' => 'call', 'name' => 'call-1', 'title' => 'Call closed',
-        ]));
-
-        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
-        $crmAdapter->expects(self::once())
-            ->method('upsertActivity')
-            ->willReturn(Activity::fromArray(['id' => 'crm-act-1']));
-
-        $ledger = $this->createMock(\Daktela\CrmSync\State\SyncLedgerInterface::class);
-        $ledger->method('hasSynced')->willReturn(true);
-        $ledger->expects(self::once())->method('recordSynced');
+        $ccAdapter->method('findActivity')->willReturnCallback(
+            fn (): Activity => Activity::fromArray([
+                'id' => 'call-1',
+                'activity_type' => 'call',
+                'name' => 'call-1',
+                'title' => $crm->nextTitle,
+            ]),
+        );
 
         $webhookSync = new WebhookSync(
             $ccAdapter,
-            $crmAdapter,
+            $crm,
             new FieldMapper(TransformerRegistry::withDefaults()),
             $this->createConfig(),
             new NullLogger(),
         );
         $webhookSync->setLedger($ledger);
 
-        $result = $webhookSync->syncActivity('call-1', ActivityType::Call);
-
-        self::assertSame(SyncStatus::Updated, $result->getRecords()[0]->status);
+        return $webhookSync;
     }
 
     public function testSyncActivityRecordsInLedgerAfterUpsert(): void
@@ -411,5 +443,147 @@ final class WebhookSyncTest extends TestCase
                 'account' => $autoContactMapping,
             ],
         );
+    }
+}
+
+/**
+ * CRM that cannot search activities (like the CRMs a ledger exists for): every
+ * upsert therefore creates. Records what was created vs updated.
+ */
+final class RecordingActivityCrmAdapter implements CrmAdapterInterface
+{
+    /** @var array<int, string> */
+    public array $created = [];
+
+    /** @var array<int, string> */
+    public array $updated = [];
+
+    public string $nextTitle = 'Call started';
+
+    public function upsertActivity(string $lookupField, Activity $activity): Activity
+    {
+        // Reference behaviour from docs/04: find-then-update, else create.
+        if ($this->findActivityByLookup($lookupField, (string) $activity->get($lookupField)) !== null) {
+            throw new \LogicException('unreachable in this fake');
+        }
+
+        $id = 'crm-' . (count($this->created) + 1);
+        $this->created[] = $id;
+
+        return Activity::fromArray(['id' => $id]);
+    }
+
+    public function updateActivity(string $id, Activity $activity): Activity
+    {
+        $this->updated[] = $id;
+
+        return Activity::fromArray(['id' => $id]);
+    }
+
+    public function createActivity(Activity $activity): Activity
+    {
+        $id = 'crm-' . (count($this->created) + 1);
+        $this->created[] = $id;
+
+        return Activity::fromArray(['id' => $id]);
+    }
+
+    public function findActivityByLookup(string $field, string $value): ?Activity
+    {
+        return null; // no server-side activity search
+    }
+
+    public function findActivity(string $id): ?Activity
+    {
+        return null;
+    }
+
+    public function findContact(string $id): ?Contact
+    {
+        return null;
+    }
+
+    public function findContactByLookup(string $field, string $value): ?Contact
+    {
+        return null;
+    }
+
+    public function iterateContacts(?\DateTimeImmutable $since = null, int $offset = 0): \Generator
+    {
+        yield from [];
+    }
+
+    public function findAccount(string $id): ?Account
+    {
+        return null;
+    }
+
+    public function findAccountByLookup(string $field, string $value): ?Account
+    {
+        return null;
+    }
+
+    public function iterateAccounts(?\DateTimeImmutable $since = null, int $offset = 0): \Generator
+    {
+        yield from [];
+    }
+
+    public function searchContacts(string $query): \Generator
+    {
+        yield from [];
+    }
+
+    public function searchAccounts(string $query): \Generator
+    {
+        yield from [];
+    }
+
+    public function iterateCustomEntity(string $entityName, ?\DateTimeImmutable $since = null, int $offset = 0): \Generator
+    {
+        yield from [];
+    }
+
+    public function findCustomEntity(string $entityName, string $id): ?array
+    {
+        return null;
+    }
+
+    public function findCustomEntityByLookup(string $entityName, string $field, string $value): ?array
+    {
+        return null;
+    }
+
+    public function ping(): bool
+    {
+        return true;
+    }
+}
+
+/** Ledger without id lookup: knows THAT a record synced, not its CRM id. */
+class WebhookPlainLedger implements \Daktela\CrmSync\State\SyncLedgerInterface
+{
+    /** @var array<string, ?string> */
+    protected array $rows = [];
+
+    public int $recordCalls = 0;
+
+    public function hasSynced(string $entityType, string $ccId): bool
+    {
+        return array_key_exists($entityType . '|' . $ccId, $this->rows);
+    }
+
+    public function recordSynced(string $entityType, string $ccId, ?string $crmId): void
+    {
+        $this->recordCalls++;
+        $this->rows[$entityType . '|' . $ccId] = $crmId;
+    }
+}
+
+/** Ledger that can hand the recorded CRM id back. */
+final class WebhookLookupLedger extends WebhookPlainLedger implements \Daktela\CrmSync\State\SyncLedgerLookupInterface
+{
+    public function findCrmId(string $entityType, string $ccId): ?string
+    {
+        return $this->rows[$entityType . '|' . $ccId] ?? null;
     }
 }

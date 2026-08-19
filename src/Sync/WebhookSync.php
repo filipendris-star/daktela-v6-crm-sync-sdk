@@ -7,6 +7,7 @@ namespace Daktela\CrmSync\Sync;
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
+use Daktela\CrmSync\State\SyncLedgerLookupInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
@@ -138,6 +139,31 @@ final class WebhookSync
         }
 
         try {
+            // A record the ledger already knows exists in the CRM, but the CRMs a
+            // ledger exists for cannot search activities — so the adapter's upsert
+            // would create a SECOND record for every follow-up event. Update it
+            // directly when the ledger can return the id; otherwise skip, which
+            // freezes the payload at the first event but never duplicates.
+            $ledger = $this->ledger;
+            $knownCrmId = null;
+            $alreadySynced = $ledger !== null && $id !== '' && $ledger->hasSynced('activity', $id);
+            if ($alreadySynced) {
+                if ($ledger instanceof SyncLedgerLookupInterface) {
+                    $knownCrmId = $ledger->findCrmId('activity', $id);
+                }
+
+                if ($knownCrmId === null) {
+                    $this->logger->notice(
+                        'Activity {id} already exported and the ledger cannot return its CRM id — skipping this event; implement SyncLedgerLookupInterface to let follow-up events update the record',
+                        ['id' => $id],
+                    );
+                    $result->addRecord(new RecordResult('activity', $id, null, SyncStatus::Skipped));
+                    $result->finish();
+
+                    return $result;
+                }
+            }
+
             $activity = $this->ccAdapter->findActivity($id, $type);
             if ($activity === null) {
                 $result->addRecord(new RecordResult('activity', $id, null, SyncStatus::Skipped));
@@ -164,15 +190,16 @@ final class WebhookSync
                 $mappedActivity = $this->crmAdapter->linkActivityToDeal($mappedActivity, $linkDeal);
             }
 
-            $synced = $this->crmAdapter->upsertActivity($typeMapping->lookupField, $mappedActivity);
+            $synced = $knownCrmId !== null
+                ? $this->crmAdapter->updateActivity($knownCrmId, $mappedActivity)
+                : $this->crmAdapter->upsertActivity($typeMapping->lookupField, $mappedActivity);
 
             // Record in the ledger so a later batch run (create-without-lookup
             // when a ledger is set) skips this activity instead of duplicating it.
-            // The webhook path itself never skips on the ledger: an activity emits
-            // several events (call_create → call_answer → call_close), and each one
-            // must be able to update the CRM record the first event created.
-            if ($this->ledger !== null && $id !== '') {
-                $this->ledger->recordSynced('activity', $id, $synced->getId());
+            // Only on first export: re-recording every follow-up event would break
+            // ledgers whose store has a unique key on (entity_type, cc_id).
+            if ($ledger !== null && $id !== '' && !$alreadySynced) {
+                $ledger->recordSynced('activity', $id, $synced->getId());
             }
 
             $result->addRecord(new RecordResult('activity', $id, $synced->getId(), SyncStatus::Updated));

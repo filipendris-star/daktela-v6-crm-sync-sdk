@@ -330,9 +330,29 @@ Without a ledger, activity export falls back to the adapter's
 never duplicate activities as long as the ledger persists.
 
 The webhook path participates too: `setLedger()` also wires the engine's
-`WebhookSync`, which skips activities the ledger already knows and records
-the ones it upserts — otherwise a webhook-pushed activity would be created a
-second time by a later batch run.
+`WebhookSync`, which records what it exports — otherwise a webhook-pushed
+activity would be created a second time by a later batch run.
+
+One activity emits several webhook events (`call_create` → `call_answer` →
+`call_close`), and every event after the first has to **update** the CRM record
+the first one created. The adapter's `upsertActivity()` cannot find that record
+on the CRMs a ledger exists for (no server-side activity search), so it would
+create a new one per event. Implement the optional
+`SyncLedgerLookupInterface` (adds `findCrmId()`) and the webhook path updates
+the recorded record directly:
+
+```php
+final class DbLedger implements SyncLedgerLookupInterface
+{
+    public function hasSynced(string $entityType, string $ccId): bool { /* … */ }
+    public function recordSynced(string $entityType, string $ccId, ?string $crmId): void { /* … */ }
+    public function findCrmId(string $entityType, string $ccId): ?string { /* SELECT crm_id … */ }
+}
+```
+
+A ledger that does not implement it makes the webhook path **skip** follow-up
+events instead: one CRM record per activity (never a duplicate), but frozen at
+the first event's payload. A notice is logged naming the interface.
 
 ## Reset State
 
