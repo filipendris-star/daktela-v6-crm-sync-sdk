@@ -9,6 +9,7 @@ use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Config\SyncConfiguration;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Mapping\FieldMapper;
+use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\Transformer\TransformerRegistry;
 use Daktela\CrmSync\State\SyncLedgerInterface;
 use Daktela\CrmSync\State\SyncStateStoreInterface;
@@ -107,6 +108,34 @@ final class SyncEngine
     }
 
     /**
+     * True when a mapping resolves cross-entity references, i.e. it needs the
+     * relation maps the account step builds. Steps without any are independent and
+     * must keep running when the account step fails.
+     */
+    private function mappingUsesRelations(?MappingCollection $mapping): bool
+    {
+        if ($mapping === null) {
+            return false;
+        }
+
+        foreach ($mapping->mappings as $rule) {
+            if ($rule->relation !== null) {
+                return true;
+            }
+        }
+
+        foreach ($mapping->typeMappings as $typeRules) {
+            foreach ($typeRules as $rule) {
+                if ($rule->relation !== null) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Mark a step as not run because a step it depends on failed. No watermark is
      * saved, so the skipped window is re-covered once the dependency recovers.
      */
@@ -194,12 +223,13 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $contactResult = new SyncResult();
-                if (!$accountStepOk) {
-                    // Contacts resolve account references through the relation maps
+                if (!$accountStepOk && $this->mappingUsesRelations($this->config->getMapping('contact'))) {
+                    // Contacts that resolve account references need the relation maps
                     // step 1 builds. Running now would write raw CRM foreign keys
                     // into Daktela (the resolver falls back to the unmapped value)
                     // and then advance the contact watermark over them — a wrong
-                    // link that no later run would ever revisit.
+                    // link that no later run would ever revisit. A mapping with no
+                    // relations has no such dependency and still runs.
                     $this->skipDependentStep('contact', $contactResult, 'account');
                 } else {
                 $this->runIsolated('contact', $contactResult, $syncStartTime, function () use (&$contactResult, $onBatch): void {
@@ -220,8 +250,8 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $activityResult = new SyncResult();
-                if (!$accountStepOk) {
-                    // Activity mappings resolve relations through the same maps.
+                if (!$accountStepOk && $this->mappingUsesRelations($this->config->getMapping('activity'))) {
+                    // Only when the activity mapping actually resolves relations.
                     $this->skipDependentStep('activity', $activityResult, 'account');
                 } else {
                 $this->runIsolated('activity', $activityResult, $syncStartTime, function () use (&$activityResult, $activityTypes, $onBatch): void {
@@ -257,8 +287,8 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $entryResult = new SyncResult();
-                if (!$accountStepOk) {
-                    // Custom entity mappings resolve relations through the same maps.
+                if (!$accountStepOk && $this->mappingUsesRelations($mapping)) {
+                    // Only when this entry's mapping actually resolves relations.
                     $this->skipDependentStep("custom:{$customEntry->name}", $entryResult, 'account');
                     $customEntityResults[$customEntry->name] = $entryResult;
                     continue;
