@@ -35,22 +35,33 @@ final readonly class MappingCollection
         }
 
         // Index non-append type rules by target so they can replace their base
-        // counterpart in place (preserving base rule order).
+        // counterpart in place (preserving base rule order). Duplicate type rules
+        // on one target: the later definition supersedes the earlier one (the
+        // superseded index is marked used so it is not appended at the end).
         $typeByKey = [];
+        $usedTypeIdx = [];
         foreach ($typeRules as $i => $rule) {
             if (!$rule->append) {
-                $typeByKey[$this->mergeKey($rule)] = $i;
+                $key = $this->mergeKey($rule);
+                if (isset($typeByKey[$key])) {
+                    $usedTypeIdx[$typeByKey[$key]] = true;
+                }
+                $typeByKey[$key] = $i;
             }
         }
 
         $merged = [];
-        $usedTypeIdx = [];
         foreach ($this->mappings as $rule) {
             $key = $this->mergeKey($rule);
             if (!$rule->append && isset($typeByKey[$key])) {
                 $idx = $typeByKey[$key];
-                $merged[] = $typeRules[$idx];
-                $usedTypeIdx[$idx] = true;
+                // Duplicate base rules on one target: place the replacement once,
+                // drop later duplicates (a side-effectful transformer must not run
+                // twice for one output field).
+                if (!isset($usedTypeIdx[$idx])) {
+                    $merged[] = $typeRules[$idx];
+                    $usedTypeIdx[$idx] = true;
+                }
             } else {
                 $merged[] = $rule;
             }
