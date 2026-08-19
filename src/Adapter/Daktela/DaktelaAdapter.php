@@ -70,17 +70,35 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         // user login up-front so hasChanges() compares login against login and
         // unchanged contacts are skipped instead of re-updated every run.
         $userValue = $contact->get('user');
+        $userNotFound = false;
         if (is_string($userValue) && str_contains($userValue, '@')) {
             $resolved = $this->findUserLoginByEmail($userValue);
             if ($resolved !== null) {
                 $contact->set('user', $resolved);
+            } else {
+                // Distinguish "no such user" (negative result cached) from a
+                // transient lookup failure (never cached): only a genuine
+                // not-found may be dropped from the change comparison below. A
+                // transient failure must keep the contact "changed", so the
+                // update path's prepareContactData() retries the lookup instead
+                // of a skip silently eating an owner-only change.
+                $userNotFound = array_key_exists(strtolower($userValue), $this->userLoginCache);
             }
         }
 
         $existing = $this->findContactBy([$lookupField => (string) $lookupValue]);
 
         if ($existing !== null && $existing->getId() !== null) {
-            if (!$this->hasChanges($existing->getData(), $contact->getData())) {
+            // A genuinely unresolvable owner email is dropped by the write path
+            // (prepareContactData), so drop it from the change comparison too —
+            // otherwise the contact looks "changed" on every run and a no-op PUT
+            // bumps `edited` forever.
+            $newData = $contact->getData();
+            if ($userNotFound && isset($newData['user']) && is_string($newData['user']) && str_contains($newData['user'], '@')) {
+                unset($newData['user']);
+            }
+
+            if (!$this->hasChanges($existing->getData(), $newData)) {
                 $this->logger->debug('Skip contact update: no changes', ['id' => $existing->getId()]);
 
                 return new UpsertResult($existing, skipped: true);
