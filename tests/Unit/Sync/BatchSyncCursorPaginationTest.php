@@ -153,6 +153,49 @@ final class BatchSyncCursorPaginationTest extends TestCase
         self::assertSame([null, 'CURSOR_P2'], $adapter->cursorsSeen);
     }
 
+
+    public function testEmptyPageWithLiveTokenDoesNotEndTheDrain(): void
+    {
+        // A scanned page whose rows were all filtered out server-side still
+        // carries a live token. Ending the drain there would clear the cursor and
+        // let the watermark advance over everything behind that token.
+        $store = new FileSyncStateStore($this->stateFile);
+
+        $adapter = new FakeCursorCrmAdapter([
+            null => new CursorPage([], 'CURSOR_P2'),
+            'CURSOR_P2' => new CursorPage([$this->contact('c1')], null),
+        ]);
+
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+
+        $r1 = $batch->syncContacts();
+        self::assertFalse($r1->isExhausted(), 'empty page with a live token must not end the drain');
+        self::assertSame('CURSOR_P2', $store->getCursor('contact'), 'the live token must be kept');
+
+        $r2 = $batch->syncContacts();
+        self::assertSame(1, $r2->getTotalCount(), 'the record behind the token is read');
+        self::assertTrue($r2->isExhausted());
+    }
+
+    public function testEndlessEmptyTokenedPagesAbortInsteadOfSpinning(): void
+    {
+        $store = new FileSyncStateStore($this->stateFile);
+
+        // Faulty adapter: every page is empty but keeps handing back a token.
+        $adapter = new FakeCursorCrmAdapter([
+            null => new CursorPage([], 'LOOP'),
+            'LOOP' => new CursorPage([], 'LOOP'),
+        ]);
+
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+
+        $this->expectException(\Daktela\CrmSync\Exception\AdapterException::class);
+
+        for ($i = 0; $i < 200; $i++) {
+            $batch->syncContacts();
+        }
+    }
+
     private function batchSync(CrmAdapterInterface $crm, FileSyncStateStore $store, int $batchSize): BatchSync
     {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);

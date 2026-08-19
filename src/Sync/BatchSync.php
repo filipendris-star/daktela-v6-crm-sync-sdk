@@ -12,6 +12,9 @@ use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
+use Daktela\CrmSync\Exception\AdapterException;
+use Daktela\CrmSync\Exception\ConfigurationException;
+use Daktela\CrmSync\Exception\NotSupportedException;
 use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Entity\Contact;
@@ -46,6 +49,12 @@ final class BatchSync
     /** @var array<string, string|null> "offset:firstRowId" of the previous export batch per key (write-back spin guard) */
     private array $exportSpinGuard = [];
 
+    /** @var array<string, int> Consecutive empty-but-tokened cursor pages per key (adapter spin guard) */
+    private array $emptyCursorPages = [];
+
+    /** Consecutive empty cursor pages tolerated before the drain is treated as an adapter fault. */
+    private const MAX_EMPTY_CURSOR_PAGES = 50;
+
     private bool $forceFullSync = false;
 
     private ?SyncLedgerInterface $ledger = null;
@@ -75,6 +84,7 @@ final class BatchSync
         $this->offsets = [];
         $this->cursors = [];
         $this->exportSpinGuard = [];
+        $this->emptyCursorPages = [];
     }
 
     /**
@@ -110,7 +120,24 @@ final class BatchSync
      */
     private function advanceCursor(string $key, CursorPage $page, int $rows, SyncResult $result): void
     {
-        $exhausted = $page->nextCursor === null || $rows === 0;
+        // Only a null next token ends the drain. An EMPTY page with a live token
+        // is the degenerate case of the short-page rule (a scanned page whose
+        // rows were all filtered out server-side): ending there would clear the
+        // cursor and let the watermark advance over everything behind that token.
+        // Bounded so a faulty adapter handing back an endless stream of empty
+        // tokened pages fails loudly instead of spinning forever.
+        if ($rows === 0 && $page->nextCursor !== null) {
+            $seen = ($this->emptyCursorPages[$key] ?? 0) + 1;
+            $this->emptyCursorPages[$key] = $seen;
+
+            if ($seen > self::MAX_EMPTY_CURSOR_PAGES) {
+                throw AdapterException::cursorPaginationStalled($key, $seen);
+            }
+        } else {
+            unset($this->emptyCursorPages[$key]);
+        }
+
+        $exhausted = $page->nextCursor === null;
         $next = $exhausted ? null : $page->nextCursor;
 
         $result->setExhausted($exhausted);
