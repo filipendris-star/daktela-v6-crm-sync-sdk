@@ -111,4 +111,81 @@ final class MappingCollectionForTypeTest extends TestCase
                 mappings: []
             YAML);
     }
+
+    public function testAppendRulesSurviveTypeMerge(): void
+    {
+        // Two base rules accumulate into `subject` via append. The merge must not
+        // dedupe them by target field — that would silently drop one whenever the
+        // type carries any rules, producing different output per activity type
+        // from the same mapping file.
+        $collection = $this->loadYaml(<<<YAML
+            entity: activity
+            lookup_field: externalId
+            default:
+              mappings:
+                - { cc_field: firstname, crm_field: subject, append: true }
+                - { cc_field: lastname, crm_field: subject, append: true }
+                - { cc_field: description, crm_field: note }
+            types:
+              call:
+                mappings:
+                  - { cc_field: item_answered, crm_field: done }
+            YAML);
+
+        $countSubject = fn ($rules) => count(array_filter($rules, fn ($m) => $m->crmField === 'subject'));
+
+        // Type with rules: both append rules must survive (this was the bug).
+        $call = $collection->forType('call');
+        self::assertSame(2, $countSubject($call->mappings), 'append rules must survive when the type has rules');
+        self::assertCount(4, $call->mappings);
+
+        // Type without rules: identical rule set either way.
+        self::assertSame(2, $countSubject($collection->forType('email')->mappings));
+    }
+
+    public function testTypeAppendRuleAddsWithoutReplacing(): void
+    {
+        $collection = $this->loadYaml(<<<YAML
+            entity: activity
+            lookup_field: externalId
+            default:
+              mappings:
+                - { cc_field: firstname, crm_field: subject, append: true }
+            types:
+              call:
+                mappings:
+                  - { cc_field: item_direction, crm_field: subject, append: true }
+            YAML);
+
+        $call = $collection->forType('call');
+        $subjectRules = array_values(array_filter($call->mappings, fn ($m) => $m->crmField === 'subject'));
+
+        self::assertCount(2, $subjectRules, 'a type append rule accumulates alongside the base one');
+        self::assertSame('firstname', $subjectRules[0]->ccField);
+        self::assertSame('item_direction', $subjectRules[1]->ccField);
+    }
+
+    public function testNonAppendTypeRuleStillOverridesBase(): void
+    {
+        // The append fix must not regress the core contract: a non-append type
+        // rule replaces the non-append base rule with the same target, in place.
+        $collection = $this->loadYaml(<<<YAML
+            entity: activity
+            lookup_field: externalId
+            default:
+              mappings:
+                - { cc_field: title, crm_field: subject }
+                - { cc_field: description, crm_field: note }
+            types:
+              call:
+                mappings:
+                  - { cc_field: item_call_state, crm_field: subject }
+            YAML);
+
+        $call = $collection->forType('call');
+
+        self::assertCount(2, $call->mappings);
+        self::assertSame('item_call_state', $call->mappings[0]->ccField, 'type rule replaces base subject rule in place');
+        self::assertSame('note', $call->mappings[1]->crmField);
+    }
 }

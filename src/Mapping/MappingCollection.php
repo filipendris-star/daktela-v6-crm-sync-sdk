@@ -20,9 +20,12 @@ final readonly class MappingCollection
 
     /**
      * Resolve the effective rule set for one activity type: base rules with the
-     * type's rules merged over them. A type rule replaces a base rule that targets
-     * the same output field (crm_field; cc_field for static-value rules without one),
-     * otherwise it is appended. Unknown/null type returns the base rules unchanged.
+     * type's rules merged over them. A non-append type rule replaces a non-append
+     * base rule that targets the same output field (crm_field; cc_field for
+     * static-value rules without one), otherwise it is appended. Append rules are
+     * never deduped — `append: true` exists precisely so several rules accumulate
+     * into one field, so both base and type append rules always survive the merge.
+     * Unknown/null type returns the base rules unchanged.
      */
     public function forType(?string $type): self
     {
@@ -31,15 +34,34 @@ final readonly class MappingCollection
             return new self($this->entityType, $this->lookupField, $this->mappings);
         }
 
-        $merged = [];
-        foreach ($this->mappings as $rule) {
-            $merged[$this->mergeKey($rule)] = $rule;
-        }
-        foreach ($typeRules as $rule) {
-            $merged[$this->mergeKey($rule)] = $rule;
+        // Index non-append type rules by target so they can replace their base
+        // counterpart in place (preserving base rule order).
+        $typeByKey = [];
+        foreach ($typeRules as $i => $rule) {
+            if (!$rule->append) {
+                $typeByKey[$this->mergeKey($rule)] = $i;
+            }
         }
 
-        return new self($this->entityType, $this->lookupField, array_values($merged));
+        $merged = [];
+        $usedTypeIdx = [];
+        foreach ($this->mappings as $rule) {
+            $key = $this->mergeKey($rule);
+            if (!$rule->append && isset($typeByKey[$key])) {
+                $idx = $typeByKey[$key];
+                $merged[] = $typeRules[$idx];
+                $usedTypeIdx[$idx] = true;
+            } else {
+                $merged[] = $rule;
+            }
+        }
+        foreach ($typeRules as $i => $rule) {
+            if (!isset($usedTypeIdx[$i])) {
+                $merged[] = $rule;
+            }
+        }
+
+        return new self($this->entityType, $this->lookupField, $merged);
     }
 
     private function mergeKey(FieldMapping $rule): string
