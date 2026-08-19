@@ -605,6 +605,7 @@ final class BatchSync
         $count = 0;
         $stillMatching = 0;
         $departedCount = 0;
+        $writeBackAttempted = 0;
         $firstId = null;
         $exhausted = true;
         // Cap one export batch at the CC adapter's page size (read from the
@@ -629,10 +630,14 @@ final class BatchSync
             // Only rows that still match (failures, no write-back) consume offset.
             // NOTE: id-less rows can't be spin-guarded (see below); they also never
             // depart (write-back needs a source id), so they always consume offset.
-            if (!$departed) {
-                $stillMatching++;
-            } else {
+            if ($departed === true) {
                 $departedCount++;
+            } else {
+                $stillMatching++;
+            }
+
+            if ($departed !== null) {
+                $writeBackAttempted++;
             }
 
             $count++;
@@ -673,8 +678,11 @@ final class BatchSync
         // is not touching a field the export_filter checks, so the rows keep
         // re-entering the window (their `edited` was just bumped) and would be
         // re-exported on every run forever.
-        $succeeded = $count - $result->getFailedCount();
-        if ($exhausted && $entry->writeBack !== [] && $succeeded > 0 && $departedCount === 0) {
+        // Fire only on evidence of misconfiguration: write-backs were actually
+        // attempted and not one of them wrote. Records whose write-back was never
+        // attempted (missing ids) or that failed for unrelated reasons must not be
+        // blamed on the config — that would wedge the slot on a transient error.
+        if ($exhausted && $writeBackAttempted > 0 && $departedCount === 0) {
             $this->logger->error(
                 'Custom entity "{name}" write_back left every exported record inside export_filter — fix the write_back/export_filter pairing',
                 ['name' => $entry->name],
@@ -708,10 +716,13 @@ final class BatchSync
 
     /**
      * @param array<string, mixed> $row
-     * @return array{0: RecordResult, 1: bool} [record, departed] — departed is true
-     *         when the write-back rewrote the CC record, i.e. by convention the
-     *         record no longer matches the export_filter and has left the
-     *         filtered result set (the offset bookkeeping depends on this).
+     * @return array{0: RecordResult, 1: ?bool} [record, departed] — true when the
+     *         write-back rewrote the CC record (by convention it no longer matches
+     *         export_filter and has left the filtered result set, which the offset
+     *         bookkeeping depends on), false when a write-back was attempted but
+     *         performed no CC write (a configuration fault), and null when none
+     *         was attempted at all (no write_back configured, or the record lacks
+     *         the ids needed — a data condition, not a misconfiguration).
      */
     private function exportCustomRecordToCrm(
         \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
@@ -719,7 +730,7 @@ final class BatchSync
         array $row,
     ): array {
         $sourceId = isset($row['id']) ? (string) $row['id'] : null;
-        $departed = false;
+        $departed = null;
 
         try {
             /** @var SupportsCustomEntityWriteInterface&CrmAdapterInterface $writer */
@@ -780,7 +791,7 @@ final class BatchSync
                 targetId: null,
                 status: SyncStatus::Failed,
                 errorMessage: $e->getMessage(),
-            ), false];
+            ), null]; // export failed: no write-back was attempted, so it proves nothing about the config
         }
     }
 

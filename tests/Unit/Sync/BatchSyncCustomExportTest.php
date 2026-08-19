@@ -195,6 +195,41 @@ final class BatchSyncCustomExportTest extends TestCase
         $batchSync->syncCustomEntity($entry, $this->mapping());
     }
 
+
+    public function testTransientFailureIsNotBlamedOnTheWriteBackConfig(): void
+    {
+        // Mixed batch: one record's CRM create fails transiently, the other
+        // succeeds but the CRM returns no id so its write-back is never attempted.
+        // No write-back was attempted at all, so nothing proves the config is
+        // wrong — throwing here would wedge the slot (its watermark can never
+        // advance) on a passing outage.
+        $ccAdapter = $this->ccAdapterYielding([
+            ['id' => 'c1', 'title' => 'A'],
+            ['id' => 'c2', 'title' => 'B'],
+        ]);
+        $ccAdapter->expects(self::never())->method('updateContact');
+
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $calls = 0;
+        $crmAdapter->method('createCustomEntity')->willReturnCallback(
+            function () use (&$calls): array {
+                if (++$calls === 1) {
+                    throw new \RuntimeException('CRM 500');
+                }
+
+                return []; // succeeded but returned no id -> write-back cannot run
+            },
+        );
+
+        $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 100);
+
+        $result = $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
+
+        self::assertSame(1, $result->getFailedCount());
+        self::assertTrue($result->isExhausted());
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private function entry(bool $withWriteBack = false): CustomEntitySyncConfig
