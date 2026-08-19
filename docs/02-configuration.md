@@ -96,8 +96,8 @@ The write_back rules **must** rewrite a field the `export_filter` checks (the
 documented convention: rename the lookup field with the CRM-id prefix). The
 export pagination relies on successful write-backs removing records from the
 filtered set; a write_back that only touches unrelated fields is detected at
-runtime and logged as a warning, but records will be re-processed once before
-the engine advances past them.
+runtime and the drain aborts with a configuration error (the sync window is
+kept, so nothing is lost — the export stays failed until the pairing is fixed).
 
 ```yaml
 sync:

@@ -296,11 +296,13 @@ final class BatchSyncCustomExportTest extends TestCase
         self::assertSame([], $rows, 'all rows left the filtered set');
     }
 
-    public function testExportSpinGuardAdvancesWhenWriteBackDoesNotShrinkTheSet(): void
+    public function testExportSpinGuardAbortsWhenWriteBackDoesNotShrinkTheSet(): void
     {
         // Degenerate config: write_back "succeeds" but writes fields the
-        // export_filter does not check, so rows never leave the set. Without the
-        // guard the same batch would be re-served forever.
+        // export_filter does not check, so rows never leave the set. The guard
+        // must ABORT (configuration error): skipping forward would step over rows
+        // that genuinely departed mid-batch and slid down, and continuing would
+        // re-serve the same batch forever. Aborting keeps the watermark.
         $rows = [
             ['id' => 'c1', 'title' => 'A'],
             ['id' => 'c2', 'title' => 'B'],
@@ -322,13 +324,73 @@ final class BatchSyncCustomExportTest extends TestCase
 
         $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 2);
 
-        $batches = 0;
-        do {
-            $result = $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
-            self::assertLessThan(10, ++$batches, 'spin guard must terminate the loop');
-        } while (!$result->isExhausted());
+        // Batch 1 processes and stores the guard; batch 2 re-serves the same
+        // first row at the same offset -> configuration error.
+        $r1 = $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
+        self::assertFalse($r1->isExhausted());
 
-        self::assertGreaterThanOrEqual(3, $batches, 'guard advances only after detecting the repeat');
+        $this->expectException(\Daktela\CrmSync\Exception\ConfigurationException::class);
+        $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
+    }
+
+    public function testSpinAbortDoesNotSkipRowsThatGenuinelyDeparted(): void
+    {
+        // Mixed batch: c1's write-back really removes it from the set, the others
+        // only pretend. The old guard advanced offset by the full batch count on a
+        // trip, silently skipping the rows that slid down into the window. The
+        // abort must fire instead, with every row still accounted for: either
+        // exported or still present in the filtered set — never vanished.
+        $rows = [];
+        foreach (['A', 'B', 'C', 'D', 'E', 'F'] as $i => $t) {
+            $rows[] = ['id' => 'c' . ($i + 1), 'title' => $t];
+        }
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('iterateEntity')->willReturnCallback(
+            function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
+                yield from array_slice($rows, $offset);
+            },
+        );
+        // Only c1 genuinely departs; every other write-back is a no-op.
+        $ccAdapter->method('updateContact')->willReturnCallback(
+            function (string $id, Contact $contact) use (&$rows): Contact {
+                if ($id === 'c1') {
+                    $rows = array_values(array_filter($rows, fn (array $r) => $r['id'] !== 'c1'));
+                }
+
+                return $contact;
+            },
+        );
+
+        $exported = [];
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $crmAdapter->method('createCustomEntity')->willReturnCallback(
+            function (string $target, array $data) use (&$exported): array {
+                $exported[] = $data['name'];
+
+                return ['id' => count($exported)];
+            },
+        );
+
+        $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 2);
+
+        $thrown = false;
+        try {
+            $batches = 0;
+            do {
+                $result = $batchSync->syncCustomEntity($this->entry(withWriteBack: true), $this->mapping());
+                self::assertLessThan(10, ++$batches, 'drain must terminate');
+            } while (!$result->isExhausted());
+        } catch (\Daktela\CrmSync\Exception\ConfigurationException) {
+            $thrown = true;
+        }
+
+        self::assertTrue($thrown, 'misconfigured write_back must abort the drain');
+        // No silent loss: every row is either exported or still in the set.
+        $accounted = array_unique(array_merge($exported, array_column($rows, 'title')));
+        sort($accounted);
+        self::assertSame(['A', 'B', 'C', 'D', 'E', 'F'], $accounted, 'no row may vanish unexported AND removed');
     }
 
     public function testExportLookupResolvesDottedCrmField(): void

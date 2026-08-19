@@ -587,31 +587,35 @@ final class BatchSync
         $result->setExhausted($exhausted);
         $result->finish();
 
-        $nextOffset = $offset + $stillMatching;
-
         // Spin guard: seeing the same first row again at the same offset means the
         // write-back "succeeded" without actually removing records from the
-        // export_filter (it writes fields the filter doesn't check). Trusting
-        // `departed` again would re-serve this batch forever — advance past it and
-        // flag the config instead. The guard binds offset AND row id (a repeat id
-        // at a different offset is legitimate movement), and ignores id-less rows.
+        // export_filter (it writes fields the filter doesn't check) — a
+        // configuration error. Abort the drain: any forward skip here would step
+        // over rows that genuinely departed mid-batch and slid down (permanent
+        // loss once the window advances), and continuing would re-serve the same
+        // batch forever. Throwing keeps the watermark (saveState never runs), so
+        // nothing is lost and the operator sees the error every run until the
+        // write_back/export_filter pairing is fixed. The guard binds offset AND
+        // row id (a repeat id at a different offset is legitimate movement), and
+        // ignores id-less rows.
         $guardValue = ($firstId !== null && $firstId !== '') ? $offset . ':' . $firstId : null;
         if (!$exhausted && $guardValue !== null
             && ($this->exportSpinGuard[$offsetKey] ?? null) === $guardValue && $stillMatching < $count) {
-            $this->logger->warning(
-                'Custom entity "{name}" write_back does not remove records from export_filter — advancing past the batch to avoid re-processing it forever; fix the write_back/export_filter pairing',
+            $this->logger->error(
+                'Custom entity "{name}" write_back does not remove records from export_filter — aborting the drain; fix the write_back/export_filter pairing',
                 ['name' => $entry->name],
             );
-            $nextOffset = $offset + $count;
+
+            throw \Daktela\CrmSync\Exception\ConfigurationException::writeBackFilterMismatch($entry->name);
         }
         // Only a non-exhausted batch can be the "previous batch" of a legitimate
         // spin comparison. Storing the guard on an exhausted batch would leave a
         // stale "offset:id" behind after the drain completes, and a later drain
         // starting with the same (e.g. persistently failing) first row would
-        // false-match it and over-advance past legitimately departed rows.
+        // false-match it.
         $this->exportSpinGuard[$offsetKey] = $exhausted ? null : $guardValue;
 
-        $this->offsets[$offsetKey] = $exhausted ? 0 : $nextOffset;
+        $this->offsets[$offsetKey] = $exhausted ? 0 : $offset + $stillMatching;
 
         $this->logger->info('Batch custom entity {name} export completed (source: {source}, target: {target})', [
             'name' => $entry->name,
