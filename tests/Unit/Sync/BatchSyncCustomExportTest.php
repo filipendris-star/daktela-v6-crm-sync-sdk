@@ -127,17 +127,19 @@ final class BatchSyncCustomExportTest extends TestCase
         self::assertSame(0, $result->getTotalCount());
     }
 
-    public function testAdapterWithoutWriteSupportIsSkippedGracefully(): void
+    public function testAdapterWithoutWriteSupportAbortsInsteadOfSkipping(): void
     {
+        // Returning a clean empty result would let saveState() advance this
+        // entity's watermark on every run, so once the adapter gains the
+        // capability everything edited in the meantime is outside the window.
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
         $ccAdapter->expects(self::never())->method('iterateEntity');
 
         $crmAdapter = $this->createMock(CrmAdapterInterface::class); // no write interface
 
-        $result = $this->runExport($ccAdapter, $crmAdapter, $this->entry(), since: new \DateTimeImmutable('-1 hour'));
+        $this->expectException(\Daktela\CrmSync\Exception\NotSupportedException::class);
 
-        self::assertSame(0, $result->getTotalCount());
-        self::assertTrue($result->isExhausted());
+        $this->runExport($ccAdapter, $crmAdapter, $this->entry(), since: new \DateTimeImmutable('-1 hour'));
     }
 
     public function testFailedCrmCreateIsRecordedPerRecord(): void
@@ -151,6 +153,46 @@ final class BatchSyncCustomExportTest extends TestCase
         $result = $this->runExport($ccAdapter, $crmAdapter, $this->entry(), since: new \DateTimeImmutable('-1 hour'));
 
         self::assertSame(1, $result->getFailedCount());
+    }
+
+
+    public function testWriteBackThatNeverWritesIsDetectedInASingleBatch(): void
+    {
+        // write_back configured, every record exported successfully, yet not one
+        // CC write happened (here: an unsupported source, so applyExportWriteBack
+        // only warns). Nothing ever leaves the export_filter, so the rows would be
+        // re-exported on every run forever — detect it even though the set fits in
+        // a single batch and the spin comparison can never arm.
+        $entry = new CustomEntitySyncConfig(
+            name: 'contact_export',
+            enabled: true,
+            direction: SyncDirection::CcToCrm,
+            source: 'ticket', // write_back supports contact/account only
+            target: 'persons',
+            mappingFile: 'mappings/contact_export.yaml',
+            exportFilter: [['field' => 'name', 'operator' => 'notlike', 'value' => 'pipedrive_person_%']],
+            writeBack: [
+                new FieldMapping('name', 'id', transformers: [
+                    ['name' => 'prefix', 'params' => ['value' => 'pipedrive_person_']],
+                ]),
+            ],
+        );
+
+        $ccAdapter = $this->ccAdapterYielding([
+            ['id' => 'c1', 'title' => 'A'],
+            ['id' => 'c2', 'title' => 'B'],
+        ]);
+        $ccAdapter->expects(self::never())->method('updateContact');
+
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $crmAdapter->method('createCustomEntity')->willReturn(['id' => 1]);
+
+        $batchSync = $this->exportBatchSync($ccAdapter, $crmAdapter, batchSize: 100);
+
+        $this->expectException(\Daktela\CrmSync\Exception\ConfigurationException::class);
+
+        $batchSync->syncCustomEntity($entry, $this->mapping());
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

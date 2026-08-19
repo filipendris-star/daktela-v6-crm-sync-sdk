@@ -635,8 +635,24 @@ final class BatchSync
                 ['name' => $entry->name],
             );
 
-            throw \Daktela\CrmSync\Exception\ConfigurationException::writeBackFilterMismatch($entry->name);
+            throw ConfigurationException::writeBackFilterMismatch($entry->name);
         }
+        // A set that fits in one batch never gets a second look, so the spin
+        // comparison above can't arm. Catch the same misconfiguration directly:
+        // every row succeeded, yet not one left the filtered set — the write_back
+        // is not touching a field the export_filter checks, so the rows keep
+        // re-entering the window (their `edited` was just bumped) and would be
+        // re-exported on every run forever.
+        if ($exhausted && $entry->writeBack !== [] && $count > 0
+            && $stillMatching === $count && $result->getFailedCount() === 0) {
+            $this->logger->error(
+                'Custom entity "{name}" write_back left every exported record inside export_filter — fix the write_back/export_filter pairing',
+                ['name' => $entry->name],
+            );
+
+            throw ConfigurationException::writeBackFilterMismatch($entry->name);
+        }
+
         // Only a non-exhausted batch can be the "previous batch" of a legitimate
         // spin comparison. Storing the guard on an exhausted batch would leave a
         // stale "offset:id" behind after the drain completes, and a later drain

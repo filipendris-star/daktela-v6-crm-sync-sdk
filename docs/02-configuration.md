@@ -95,9 +95,13 @@ adapter implementing `SupportsCustomEntityWriteInterface`.
 The write_back rules **must** rewrite a field the `export_filter` checks (the
 documented convention: rename the lookup field with the CRM-id prefix). The
 export pagination relies on successful write-backs removing records from the
-filtered set; a write_back that only touches unrelated fields is detected at
-runtime and the drain aborts with a configuration error (the sync window is
-kept, so nothing is lost — the export stays failed until the pairing is fixed).
+filtered set. Two misconfigurations are detected at runtime and abort the drain
+with a configuration error (the sync window is kept, so nothing is lost): a
+write_back that performs no CC write at all, and one whose records keep
+re-appearing across batches. A write_back that *does* write but touches only
+fields the export_filter ignores cannot be detected inside a single batch — with
+a filtered set smaller than one batch it will silently re-export the same records
+on every run, so verify the pairing when you configure it.
 
 ```yaml
 sync:
