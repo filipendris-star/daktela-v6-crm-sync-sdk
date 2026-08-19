@@ -55,10 +55,22 @@ final class BatchSyncCustomExportTest extends TestCase
         self::assertSame(['contact_abc', 'pipedrive_person_555'], $renamed, 'write_back must stamp the prefixed CRM id');
     }
 
-    public function testExportUpdatesWhenLookupMatchesAndSkipsWriteBack(): void
+    public function testExportUpdatesWhenLookupMatchesAndRetriesWriteBack(): void
     {
+        // A record that matches the export filter yet already exists in the CRM
+        // means an earlier run created it but its write-back failed (the rename
+        // is what removes it from the filter). The update branch must therefore
+        // retry the write-back, or the record re-processes forever.
         $ccAdapter = $this->ccAdapterYielding(self::ROWS);
-        $ccAdapter->expects(self::never())->method('updateContact');
+
+        $renamed = null;
+        $ccAdapter->expects(self::once())
+            ->method('updateContact')
+            ->willReturnCallback(function (string $id, Contact $contact) use (&$renamed) {
+                $renamed = [$id, $contact->get('name')];
+
+                return $contact;
+            });
 
         $crmAdapter = $this->writableCrmAdapter();
         $crmAdapter->method('findCustomEntityByLookup')->willReturn(['id' => 99]);
@@ -71,6 +83,7 @@ final class BatchSyncCustomExportTest extends TestCase
         $result = $this->runExport($ccAdapter, $crmAdapter, $this->entry(withWriteBack: true), since: new \DateTimeImmutable('-1 hour'));
 
         self::assertSame(1, $result->getUpdatedCount());
+        self::assertSame(['contact_abc', 'pipedrive_person_99'], $renamed, 'update branch must retry the write-back rename');
     }
 
     public function testFirstRunSeedsCursorAndExportsNothing(): void

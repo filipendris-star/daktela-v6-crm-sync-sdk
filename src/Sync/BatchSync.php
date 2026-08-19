@@ -538,6 +538,14 @@ final class BatchSync
                 $targetId = (string) $existing['id'];
                 $writer->updateCustomEntity($entry->target, $targetId, $mapped);
                 $status = SyncStatus::Updated;
+
+                // The record still matched the export filter even though its CRM
+                // counterpart exists — a previous run's write-back must have
+                // failed after the create. Retry it here so the record finally
+                // leaves the export window instead of re-processing forever.
+                if ($entry->writeBack !== [] && $sourceId !== null) {
+                    $this->applyExportWriteBack($entry, $sourceId, $existing);
+                }
             } else {
                 $created = $writer->createCustomEntity($entry->target, $mapped);
                 $targetId = isset($created['id']) ? (string) $created['id'] : null;
