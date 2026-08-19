@@ -6,6 +6,7 @@ namespace Daktela\CrmSync\Sync;
 
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
+use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
@@ -150,14 +151,26 @@ final class WebhookSync
                 return $result;
             }
 
-            $mapped = $this->fieldMapper->map($activity, $mapping, SyncDirection::CcToCrm);
+            // Per-activity-type rules must apply here exactly as on the batch
+            // path: the two paths write the same CRM records (and cooperate via
+            // the ledger, which makes a webhook-written payload permanent — a
+            // later batch run skips it), so mapping them differently would leave
+            // uncorrectable records behind.
+            $typeMapping = $mapping->forType($type->value);
+
+            $mapped = $this->fieldMapper->map($activity, $typeMapping, SyncDirection::CcToCrm);
             $mappedActivity = Activity::fromArray($mapped);
 
             if ($activity->getActivityType() !== null) {
                 $mappedActivity->setActivityType($activity->getActivityType());
             }
 
-            $synced = $this->crmAdapter->upsertActivity($mapping->lookupField, $mappedActivity);
+            $linkDeal = $this->config->getEntityConfig('activity')?->linkDeal;
+            if ($linkDeal !== null && $this->crmAdapter instanceof SupportsDealLinkingInterface) {
+                $mappedActivity = $this->crmAdapter->linkActivityToDeal($mappedActivity, $linkDeal);
+            }
+
+            $synced = $this->crmAdapter->upsertActivity($typeMapping->lookupField, $mappedActivity);
 
             // Record in the ledger so a later batch run (create-without-lookup
             // when a ledger is set) skips this activity instead of duplicating it.

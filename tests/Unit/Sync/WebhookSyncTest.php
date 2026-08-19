@@ -254,6 +254,80 @@ final class WebhookSyncTest extends TestCase
         self::assertSame(1, $result->getTotalCount());
     }
 
+
+    public function testSyncActivityAppliesPerTypeMappingRules(): void
+    {
+        // The webhook and batch paths write the same CRM records and cooperate
+        // via the ledger (a webhook payload the ledger records is never revisited
+        // by a batch run), so the webhook path must apply per-activity-type rules
+        // exactly as the batch path does — otherwise it writes a permanently
+        // wrong payload.
+        $activity = Activity::fromArray([
+            'id' => 'call-1',
+            'activity_type' => 'call',
+            'name' => 'call-1',
+            'title' => 'Missed call',
+            'item_call_state' => 'in_missed',
+        ]);
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('findActivity')->willReturn($activity);
+
+        $payload = null;
+        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
+        $crmAdapter->method('upsertActivity')->willReturnCallback(
+            function (string $lookupField, Activity $mapped) use (&$payload): Activity {
+                $payload = $mapped->getData();
+
+                return Activity::fromArray(['id' => 'crm-act-1']);
+            },
+        );
+
+        $webhookSync = new WebhookSync(
+            $ccAdapter,
+            $crmAdapter,
+            new FieldMapper(TransformerRegistry::withDefaults()),
+            $this->createConfigWithActivityTypeRules(),
+            new NullLogger(),
+        );
+
+        $webhookSync->syncActivity('call-1', ActivityType::Call);
+
+        self::assertIsArray($payload);
+        self::assertArrayHasKey('done', $payload, 'per-type rule must be applied on the webhook path');
+        self::assertSame(0, $payload['done'], 'missed inbound call must map to done = 0');
+    }
+
+    private function createConfigWithActivityTypeRules(): SyncConfiguration
+    {
+        $activityMapping = new MappingCollection(
+            'activity',
+            'name',
+            [
+                new FieldMapping('name', 'external_id'),
+                new FieldMapping('title', 'subject'),
+            ],
+            [
+                'call' => [
+                    new FieldMapping('item_call_state', 'done', transformers: [
+                        ['name' => 'value_map', 'params' => ['map' => ['in_missed' => 0], 'default' => 1]],
+                    ]),
+                ],
+            ],
+        );
+
+        return new SyncConfiguration(
+            instanceUrl: 'https://test.daktela.com',
+            accessToken: 'test-token',
+            database: 'test-db',
+            batchSize: 100,
+            entities: [
+                'activity' => new EntitySyncConfig(true, SyncDirection::CcToCrm, 'activities.yaml', [ActivityType::Call]),
+            ],
+            mappings: ['activity' => $activityMapping],
+        );
+    }
+
     private function createConfig(): SyncConfiguration
     {
         $contactMapping = new MappingCollection('contact', 'email', [
