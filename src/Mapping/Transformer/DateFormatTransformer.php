@@ -69,8 +69,11 @@ final class DateFormatTransformer implements ValueTransformerInterface
             // The date-only rule above keys on the configured format, but this
             // path accepted a value the format did not describe: re-apply the
             // rule to the value itself, or a date-only value slipping through a
-            // datetime format would still shift by a whole day.
-            if ($toTz !== null && preg_match('/\d{1,2}:\d{2}/', (string) $value) !== 1) {
+            // datetime format would still shift by a whole day. date_parse
+            // reports what it actually parsed, so compact ISO ("20240601T143000"),
+            // "2pm" and "14.30" are correctly recognised as carrying a time.
+            $parsed = date_parse((string) $value);
+            if ($toTz !== null && ($parsed['hour'] ?? false) === false) {
                 $toTz = null;
             }
         }

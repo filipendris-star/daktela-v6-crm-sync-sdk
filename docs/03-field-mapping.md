@@ -252,10 +252,12 @@ date: a Prague summer time converts at +2 h, a winter time at +1 h.
 ```
 
 Fields the `from` format leaves unspecified are anchored to zero (not filled
-from the current time). `to_tz` only applies when the `from` format carries
-time-of-day (`H`/`G`/`h`/`g`/`i`/`s`/`v`/`u`/`U`): a date is not an instant, so for
-date-only formats the conversion is skipped and the date passes through
-unshifted instead of moving a day backward east of UTC.
+from the current time). `to_tz` only applies when a time-of-day is actually
+present: a date is not an instant, so for date-only input the conversion is
+skipped and the date passes through unshifted instead of moving a day backward
+east of UTC. This is decided by the `from` format's time specifiers
+(`H`/`G`/`h`/`g`/`i`/`s`/`v`/`u`/`U`) and, when a value doesn't match that format and
+falls back to generic parsing, by whether the value itself parsed a time.
 
 ### `phone_normalize`
 Strips all non-digit/non-plus characters and optionally prepends `+` for E.164 format.

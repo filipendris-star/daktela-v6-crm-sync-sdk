@@ -181,15 +181,40 @@ final class DateFormatTransformerTest extends TestCase
         self::assertSame('2024-06-01', $result);
     }
 
-    public function testFallbackParseStillConvertsWhenValueCarriesTime(): void
+    #[\PHPUnit\Framework\Attributes\DataProvider('timeCarryingFallbackValuesProvider')]
+    public function testFallbackParseStillConvertsWhenValueCarriesTime(string $value): void
     {
-        $result = $this->transformer->transform('2024-06-01T14:30:00', [
+        // The date-only rule must key on what was actually parsed, not on a colon
+        // pattern: compact ISO 8601 (iCalendar DTSTART), "2pm" and dotted times
+        // all carry a time and must be converted.
+        $result = $this->transformer->transform($value, [
             'from' => 'Y-m-d H:i:s',
             'to' => 'H:i',
             'from_tz' => 'Europe/Prague',
             'to_tz' => 'UTC',
         ]);
 
-        self::assertSame('12:30', $result);
+        self::assertSame('12:30', $result, sprintf('value "%s" carries a time and must convert', $value));
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function timeCarryingFallbackValuesProvider(): iterable
+    {
+        yield 'iso extended' => ['2024-06-01T14:30:00'];
+        yield 'iso basic' => ['20240601T143000'];
+        yield 'iso basic without separator' => ['20240601143000'];
+        yield 'dotted time' => ['01-Jun-2024 14.30'];
+    }
+
+    public function testFallbackParseConvertsMeridiemValues(): void
+    {
+        $result = $this->transformer->transform('2024-06-01 2pm', [
+            'from' => 'Y-m-d H:i:s',
+            'to' => 'H:i',
+            'from_tz' => 'Europe/Prague',
+            'to_tz' => 'UTC',
+        ]);
+
+        self::assertSame('12:00', $result);
     }
 }
