@@ -329,6 +329,11 @@ Without a ledger, activity export falls back to the adapter's
 `upsertActivity()` lookup-then-write path. Re-runs and forced full re-syncs
 never duplicate activities as long as the ledger persists.
 
+The webhook path participates too: `setLedger()` also wires the engine's
+`WebhookSync`, which skips activities the ledger already knows and records
+the ones it upserts — otherwise a webhook-pushed activity would be created a
+second time by a later batch run.
+
 ## Reset State
 
 Clear saved timestamps so the next run starts from scratch:

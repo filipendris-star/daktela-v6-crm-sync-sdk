@@ -60,6 +60,7 @@ final class SyncEngine
     public function setLedger(?SyncLedgerInterface $ledger): void
     {
         $this->batchSync->setLedger($ledger);
+        $this->webhookSync->setLedger($ledger);
     }
 
     /**

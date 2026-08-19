@@ -24,6 +24,8 @@ use Psr\Log\LoggerInterface;
 
 final class WebhookSync
 {
+    private ?\Daktela\CrmSync\State\SyncLedgerInterface $ledger = null;
+
     public function __construct(
         private readonly ContactCentreAdapterInterface $ccAdapter,
         private readonly CrmAdapterInterface $crmAdapter,
@@ -31,6 +33,17 @@ final class WebhookSync
         private readonly SyncConfiguration $config,
         private readonly LoggerInterface $logger,
     ) {
+    }
+
+    /**
+     * Same idempotency ledger the batch path uses (see SyncEngine::setLedger).
+     * Without it, a webhook-pushed activity is upserted but never recorded, so a
+     * later batch run — which creates without a CRM lookup when a ledger is set —
+     * would create a second CRM record for the same activity.
+     */
+    public function setLedger(?\Daktela\CrmSync\State\SyncLedgerInterface $ledger): void
+    {
+        $this->ledger = $ledger;
     }
 
     public function syncContact(string $id): SyncResult
@@ -124,6 +137,12 @@ final class WebhookSync
         }
 
         try {
+            if ($this->ledger !== null && $id !== '' && $this->ledger->hasSynced('activity', $id)) {
+                $result->addRecord(new RecordResult('activity', $id, null, SyncStatus::Skipped));
+                $result->finish();
+                return $result;
+            }
+
             $activity = $this->ccAdapter->findActivity($id, $type);
             if ($activity === null) {
                 $result->addRecord(new RecordResult('activity', $id, null, SyncStatus::Skipped));
@@ -139,6 +158,12 @@ final class WebhookSync
             }
 
             $synced = $this->crmAdapter->upsertActivity($mapping->lookupField, $mappedActivity);
+
+            // Record in the ledger so a later batch run (create-without-lookup
+            // when a ledger is set) skips this activity instead of duplicating it.
+            if ($this->ledger !== null && $id !== '') {
+                $this->ledger->recordSynced('activity', $id, $synced->getId());
+            }
 
             $result->addRecord(new RecordResult('activity', $id, $synced->getId(), SyncStatus::Updated));
         } catch (\Throwable $e) {

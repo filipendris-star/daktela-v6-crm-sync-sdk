@@ -106,6 +106,65 @@ final class WebhookSyncTest extends TestCase
         self::assertSame(SyncStatus::Updated, $result->getRecords()[0]->status);
     }
 
+
+    public function testSyncActivitySkipsWhenLedgerKnowsIt(): void
+    {
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->expects(self::never())->method('findActivity');
+
+        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
+        $crmAdapter->expects(self::never())->method('upsertActivity');
+
+        $ledger = $this->createMock(\Daktela\CrmSync\State\SyncLedgerInterface::class);
+        $ledger->method('hasSynced')->with('activity', 'call-1')->willReturn(true);
+
+        $webhookSync = new WebhookSync(
+            $ccAdapter,
+            $crmAdapter,
+            new FieldMapper(TransformerRegistry::withDefaults()),
+            $this->createConfig(),
+            new NullLogger(),
+        );
+        $webhookSync->setLedger($ledger);
+
+        $result = $webhookSync->syncActivity('call-1', ActivityType::Call);
+
+        self::assertSame(SyncStatus::Skipped, $result->getRecords()[0]->status);
+    }
+
+    public function testSyncActivityRecordsInLedgerAfterUpsert(): void
+    {
+        // Without this, a webhook-pushed activity is upserted but never recorded,
+        // and a later batch run (create-without-lookup when a ledger is set)
+        // creates a second CRM record for the same activity.
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('findActivity')->willReturn(Activity::fromArray([
+            'id' => 'call-1', 'activity_type' => 'call', 'name' => 'call-1', 'title' => 'Test call',
+        ]));
+
+        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
+        $crmAdapter->method('upsertActivity')->willReturn(Activity::fromArray(['id' => 'crm-act-1']));
+
+        $ledger = $this->createMock(\Daktela\CrmSync\State\SyncLedgerInterface::class);
+        $ledger->method('hasSynced')->willReturn(false);
+        $ledger->expects(self::once())
+            ->method('recordSynced')
+            ->with('activity', 'call-1', 'crm-act-1');
+
+        $webhookSync = new WebhookSync(
+            $ccAdapter,
+            $crmAdapter,
+            new FieldMapper(TransformerRegistry::withDefaults()),
+            $this->createConfig(),
+            new NullLogger(),
+        );
+        $webhookSync->setLedger($ledger);
+
+        $result = $webhookSync->syncActivity('call-1', ActivityType::Call);
+
+        self::assertSame(SyncStatus::Updated, $result->getRecords()[0]->status);
+    }
+
     public function testSyncContactHandlesException(): void
     {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
