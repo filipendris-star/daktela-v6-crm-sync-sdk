@@ -81,7 +81,13 @@ $engine = new SyncEngine(
 
 The engine automatically loops through all batches for each entity type. State is **only** saved after all batches complete, and only when:
 
-- **No failures** — if any record fails to sync in any batch, the timestamp is not updated (so the next run retries all records from the same point)
+- **Give the scheduled run a timeout.** The SDK trusts an adapter's pagination: a
+  fresh page token means "there is more", however many record-less pages precede
+  it, because a filtered search legitimately scans many. An adapter whose
+  `has_more` never turns false therefore drains forever, and bounding a run's
+  total work belongs to whatever schedules it (`timeout`, a systemd
+  `RuntimeMaxSec`, or equivalent).
+- **Total failure only** — the timestamp is withheld only when *every* record failed, so the next run re-covers the same window. A partial failure still advances it: individually failed records are reported in `SyncResult` but are not re-offered automatically (their source timestamp has not moved), so re-drive them from the result if that matters
 
 This means the engine will never skip records due to a partial sync or per-batch failures.
 

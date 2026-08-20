@@ -71,6 +71,7 @@ use Daktela\CrmSync\Entity\Account;
 use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\Contact;
 use Daktela\CrmSync\Exception\AdapterException;
+use Daktela\CrmSync\Exception\RecordNotFoundException;
 
 final class SalesforceCrmAdapter implements CrmAdapterInterface
 {
@@ -173,6 +174,13 @@ final class SalesforceCrmAdapter implements CrmAdapterInterface
             $this->client->update('Task', $id, $activity->toArray());
             return Activity::fromArray(array_merge($activity->toArray(), ['id' => $id]));
         } catch (\Throwable $e) {
+            // A definite "gone" (404/410) is the one failure the sync layer can
+            // recover from, by re-creating the record — see "Signalling a Deleted
+            // Record" below. Everything else stays a retryable failure.
+            if ($this->client->statusCode($e) === 404) {
+                throw RecordNotFoundException::forRecord('activity', $id, $e);
+            }
+
             throw AdapterException::updateFailed('activity', $id, $e);
         }
     }
@@ -307,6 +315,32 @@ When activity sync is configured for a read-only adapter, the sync engine will c
 6. **Throw `AdapterException`** for failures — The sync engine catches these per-record
 7. **Throw `NotSupportedException`** for unsupported operations — e.g., activity CRUD on read-only adapters
 8. **Include all fields the mapping needs** — Check your YAML mapping to know which CRM fields to include
+9. **Throw `RecordNotFoundException`** — and only it — when the CRM says a record is gone (see below)
+
+## Signalling a Deleted Record
+
+`RecordNotFoundException` (a subclass of `AdapterException`) means one specific
+thing: a **write** targeted a record the remote system says no longer exists —
+HTTP 404/410, or an error code meaning "no such record". It is the only failure
+the sync layer can recover from, by re-creating the record.
+
+It applies to `updateActivity()` and other writes against a known id. Do **not**
+throw it from the `find*` read methods: there, "not found" is the normal answer
+and its channel is a `null` return. Those two must not be swapped —
+`findAccount()` returning null means "no such account", which relation
+resolution handles by passing the value through (docs/03 step 5), while a
+throw from `findAccount()` fails every record referencing it. Reserve throwing
+in `find*` for the case where the CRM could not be asked at all.
+
+Throw it **only** for that. A timeout, a 500 or a rate-limit means "unknown, try
+again": re-creating on those produces a duplicate and repoints the idempotency
+ledger at the copy, so a brief outage becomes permanent duplication. Anything
+that is not a definite "gone" must stay an ordinary `AdapterException`, which
+the engine reports as a retryable per-record failure.
+
+Not throwing it at all is safe — the recovery path simply never activates, and
+an update against a deleted record keeps failing until someone intervenes. An
+adapter can adopt this at any time without changes elsewhere.
 
 ## Account Relationship
 

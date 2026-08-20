@@ -7,6 +7,10 @@ namespace Daktela\CrmSync\Tests\Unit\Sync;
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\SupportsCustomEntityWriteInterface;
+use Daktela\CrmSync\Adapter\UpsertResult;
+use Daktela\CrmSync\Entity\Account;
+use Daktela\CrmSync\Entity\Activity;
+use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Config\CustomEntitySyncConfig;
 use Daktela\CrmSync\Config\SyncConfiguration;
 use Daktela\CrmSync\Entity\Contact;
@@ -156,13 +160,17 @@ final class BatchSyncCustomExportTest extends TestCase
     }
 
 
-    public function testWriteBackThatNeverWritesIsDetectedInASingleBatch(): void
+    public function testUnsupportedWriteBackSourceIsDetectedInASingleBatch(): void
     {
-        // write_back configured, every record exported successfully, yet not one
-        // CC write happened (here: an unsupported source, so applyExportWriteBack
-        // only warns). Nothing ever leaves the export_filter, so the rows would be
-        // re-exported on every run forever — detect it even though the set fits in
+        // A source whose write-back target applyExportWriteBack() does not support:
+        // it only warns, so nothing ever leaves the export_filter and the rows would
+        // be re-exported on every run forever. Detected even though the set fits in
         // a single batch and the spin comparison can never arm.
+        //
+        // This is the fallback branch: no write-back wrote at all, so there is no
+        // set change to verify. The case where write-backs DO write but the records
+        // stay put is covered by
+        // testWriteBackThatDoesNotShrinkTheFilteredSetIsDetectedInASingleBatch.
         $entry = new CustomEntitySyncConfig(
             name: 'contact_export',
             enabled: true,
@@ -262,6 +270,118 @@ final class BatchSyncCustomExportTest extends TestCase
     }
 
     /** @param array<int, array<string, mixed>> $rows */
+    public function testWriteBackThatDoesNotShrinkTheFilteredSetIsDetectedInASingleBatch(): void
+    {
+        // The real misconfiguration: write_back reports success on a supported
+        // source, so "did it depart?" is true for every row — yet the records never
+        // leave export_filter, because the field it writes is not the field the
+        // filter checks. Nothing in the batch's own bookkeeping can see that.
+        //
+        // The store here is faithful: the write-back mutates it and the query
+        // reflects the mutation. A fake that answers the verification query without
+        // applying the write-back would pass this test no matter what the code does.
+        // export_filter selects records with no crm_id; write_back writes 'note'.
+        $cc = new ExportFilterAwareCcAdapter(
+            rows: [['name' => 'c1', 'title' => 'A'], ['name' => 'c2', 'title' => 'B']],
+            inFilteredSet: static fn (array $r): bool => ($r['crm_id'] ?? null) === null,
+        );
+
+        $entry = $this->entryWritingBack('note');
+        $batchSync = $this->exportBatchSync($cc, $this->stubCrmAdapter(), batchSize: 100);
+
+        $this->expectException(\Daktela\CrmSync\Exception\ConfigurationException::class);
+        $batchSync->syncCustomEntity($entry, $this->mapping());
+    }
+
+    public function testWriteBackFollowingTheDocumentedRenameConventionIsNotBlamed(): void
+    {
+        // The convention docs/02 prescribes: write_back rewrites the very field the
+        // export_filter checks, so the record leaves the set by being renamed. A
+        // verification keyed on the record's original id reports "gone" here whether
+        // or not anything worked — which is why the check re-asks the export query
+        // instead of identifying the record.
+        // export_filter selects records not yet renamed; write_back rewrites `name`.
+        $cc = new ExportFilterAwareCcAdapter(
+            rows: [['name' => 'c1', 'title' => 'A'], ['name' => 'c2', 'title' => 'B']],
+            inFilteredSet: static fn (array $r): bool => !str_starts_with((string) $r['name'], 'pipedrive_person_'),
+        );
+
+        $entry = $this->entryWritingBack('name', [['field' => 'name', 'operator' => 'notlike', 'value' => 'pipedrive_person_%']]);
+        $batchSync = $this->exportBatchSync($cc, $this->stubCrmAdapter(), batchSize: 100);
+
+        $result = $batchSync->syncCustomEntity($entry, $this->mapping());
+
+        self::assertSame(2, $result->getTotalCount());
+        self::assertSame(0, $result->getFailedCount());
+        self::assertSame([], $cc->matchingRows(), 'both records left the filtered set');
+    }
+
+    public function testTransientFailureOnTheFirstRowIsNotBlamedOnTheConfig(): void
+    {
+        // The first row legitimately stays in the set because its CRM write failed.
+        // Blaming the config would throw ConfigurationException, freeze the
+        // watermark and wedge the slot on every later run — turning one 503 into a
+        // permanent "fix your config".
+        $cc = new ExportFilterAwareCcAdapter(
+            rows: [['name' => 'c1', 'title' => 'A']],
+            inFilteredSet: static fn (array $r): bool => ($r['crm_id'] ?? null) === null,
+        );
+
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $crmAdapter->method('createCustomEntity')->willThrowException(new \RuntimeException('CRM 503'));
+
+        $batchSync = $this->exportBatchSync($cc, $crmAdapter, batchSize: 100);
+        $result = $batchSync->syncCustomEntity($this->entryWritingBack('note'), $this->mapping());
+
+        self::assertSame(1, $result->getFailedCount(), 'reported as a record failure, not a config error');
+    }
+
+    public function testAFailingVerificationQueryDoesNotBlameTheConfig(): void
+    {
+        // The verification is diagnostic. If the CC side cannot answer it, that is
+        // not evidence of a misconfiguration.
+        $cc = new ExportFilterAwareCcAdapter(
+            rows: [['name' => 'c1', 'title' => 'A']],
+            inFilteredSet: static fn (array $r): bool => ($r['crm_id'] ?? null) === null,
+            failVerification: true,
+        );
+
+        $batchSync = $this->exportBatchSync($cc, $this->stubCrmAdapter(), batchSize: 100);
+        $result = $batchSync->syncCustomEntity($this->entryWritingBack('note'), $this->mapping());
+
+        self::assertSame(1, $result->getTotalCount(), 'the export itself still counts');
+        self::assertSame(0, $result->getFailedCount());
+    }
+
+    private function stubCrmAdapter(): CrmAdapterInterface&SupportsCustomEntityWriteInterface&MockObject
+    {
+        $crmAdapter = $this->writableCrmAdapter();
+        $crmAdapter->method('findCustomEntityByLookup')->willReturn(null);
+        $crmAdapter->method('createCustomEntity')->willReturn(['id' => 1]);
+
+        return $crmAdapter;
+    }
+
+    /** @param list<array<string, mixed>> $exportFilter */
+    private function entryWritingBack(string $ccField, array $exportFilter = []): CustomEntitySyncConfig
+    {
+        return new CustomEntitySyncConfig(
+            name: 'contact_export',
+            enabled: true,
+            direction: SyncDirection::CcToCrm,
+            source: 'contact',
+            target: 'persons',
+            mappingFile: 'mappings/contact_export.yaml',
+            exportFilter: $exportFilter !== [] ? $exportFilter : [['field' => 'crm_id', 'operator' => 'isnull', 'value' => null]],
+            writeBack: [
+                new FieldMapping($ccField, 'id', transformers: [
+                    ['name' => 'prefix', 'params' => ['value' => 'pipedrive_person_']],
+                ]),
+            ],
+        );
+    }
+
     private function ccAdapterYielding(array $rows): ContactCentreAdapterInterface&MockObject
     {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
@@ -588,5 +708,141 @@ final class BatchSyncCustomExportTest extends TestCase
             new NullLogger(),
             $stateStore,
         );
+    }
+}
+
+/**
+ * CC adapter with a real store: `name` is the identity, `updateContact()` mutates
+ * (including renaming when the write-back targets `name`), and `iterateEntity()`
+ * honours the entry's export_filter against the current contents. Without that
+ * fidelity a fixture can assert a state the CC side could never be in.
+ */
+final class ExportFilterAwareCcAdapter implements ContactCentreAdapterInterface
+{
+    /** @var array<string, array<string, mixed>> */
+    private array $store = [];
+
+    /**
+     * @param list<array<string, mixed>>       $rows
+     * @param callable(array<string, mixed>): bool $inFilteredSet what export_filter selects
+     */
+    public function __construct(
+        array $rows,
+        private readonly \Closure $inFilteredSet,
+        private readonly bool $failVerification = false,
+    ) {
+        foreach ($rows as $row) {
+            $this->store[(string) $row['name']] = $row;
+        }
+    }
+
+    /** @return list<string> names of rows still inside the filtered set */
+    public function matchingRows(): array
+    {
+        $out = [];
+        foreach ($this->store as $name => $row) {
+            if (($this->inFilteredSet)($row)) {
+                $out[] = (string) $name;
+            }
+        }
+
+        return $out;
+    }
+
+    public function iterateEntity(
+        string $entityType,
+        ?\DateTimeImmutable $since = null,
+        int $offset = 0,
+        array $filters = [],
+        string $sinceField = 'edited',
+    ): \Generator {
+        if ($this->failVerification && $this->queries > 0) {
+            throw new \RuntimeException('CC /contacts returned 503');
+        }
+        $this->queries++;
+
+        $matching = [];
+        foreach ($this->matchingRows() as $name) {
+            $row = $this->store[$name];
+            $row['id'] = $name;
+            $matching[] = $row;
+        }
+
+        yield from array_slice($matching, $offset);
+    }
+
+    private int $queries = 0;
+
+    public function updateContact(string $id, Contact $contact): Contact
+    {
+        $existing = $this->store[$id] ?? [];
+        $written = array_filter($contact->toArray(), static fn ($v) => $v !== null);
+
+        // A write to `name` renames the record — its identity moves with it.
+        $newName = isset($written['name']) ? (string) $written['name'] : $id;
+        unset($this->store[$id]);
+        $this->store[$newName] = array_merge($existing, $written, ['name' => $newName]);
+
+        return Contact::fromArray($this->store[$newName]);
+    }
+
+    public function findContact(string $id): ?Contact
+    {
+        return isset($this->store[$id]) ? Contact::fromArray($this->store[$id]) : null;
+    }
+
+    public function findContactBy(array $criteria): ?Contact
+    {
+        return null;
+    }
+
+    public function createContact(Contact $contact): Contact
+    {
+        return $contact;
+    }
+
+    public function upsertContact(string $lookupField, Contact $contact): UpsertResult
+    {
+        return new UpsertResult($contact);
+    }
+
+    public function findAccount(string $id): ?Account
+    {
+        return null;
+    }
+
+    public function findAccountBy(array $criteria): ?Account
+    {
+        return null;
+    }
+
+    public function createAccount(Account $account): Account
+    {
+        return $account;
+    }
+
+    public function updateAccount(string $id, Account $account): Account
+    {
+        return $account;
+    }
+
+    public function upsertAccount(string $lookupField, Account $account): UpsertResult
+    {
+        return new UpsertResult($account);
+    }
+
+    public function findActivity(string $id, ActivityType $type): ?Activity
+    {
+        return null;
+    }
+
+    public function iterateActivities(ActivityType $type, ?\DateTimeImmutable $since = null, int $offset = 0): \Generator
+    {
+        yield from [];
+    }
+
+    public function ping(): bool
+    {
+        return true;
     }
 }

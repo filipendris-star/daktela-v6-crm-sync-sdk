@@ -17,6 +17,18 @@ interface SyncLedgerInterface
     /** True if $ccId (a Contact Centre record id) has already been exported. */
     public function hasSynced(string $entityType, string $ccId): bool;
 
-    /** Record that $ccId was exported, storing the resulting CRM id (if any). */
+    /**
+     * Record that $ccId was exported, storing the resulting CRM id (if any).
+     *
+     * Must behave as an UPSERT on (entityType, ccId): recording the same pair
+     * again has to overwrite the stored CRM id, not fail. The webhook path
+     * re-records when a record was deleted CRM-side and re-created, so a plain
+     * INSERT against a unique key would throw there — after the replacement CRM
+     * record already exists — leaving the ledger naming the dead one and adding
+     * another copy on every subsequent event.
+     *
+     * A null $crmId is legal and means "exported, but the adapter named no
+     * record". It still counts as exported for hasSynced().
+     */
     public function recordSynced(string $entityType, string $ccId, ?string $crmId): void;
 }

@@ -237,12 +237,14 @@ final class FullSyncTest extends TestCase
     }
 
 
-    public function testFailedAccountStepGatesContactsInsteadOfWritingRawCrmIds(): void
+    public function testCrmOutageFailsTheRecordsThatNeedItInsteadOfWritingRawCrmIds(): void
     {
-        // Contacts resolve account references through the relation maps step 1
-        // builds. If step 1 blew up and step 3 ran anyway, the resolver would fall
-        // back to the raw CRM foreign key, write it into Daktela, report failed=0
-        // and advance the contact watermark — a permanent wrong link.
+        // A CRM outage takes the account listing AND the per-id lookup with it, so
+        // the contact's account reference cannot be resolved by either route. The
+        // resolver's fallback is to pass the raw CRM foreign key through, which
+        // would write "crm-a9" into the Daktela account field, report failed=0 and
+        // advance the contact watermark — a permanent wrong link no run revisits.
+        // The contact must fail as a record instead.
         $crm = new FailingAccountsCrmAdapter(
             contacts: [Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@t.com', 'company_id' => 'crm-a9'])],
         );
@@ -252,42 +254,75 @@ final class FullSyncTest extends TestCase
 
         self::assertTrue($results->hasStepFailures(), 'the run must not look successful');
         self::assertArrayHasKey('account', $results->stepFailures);
-        self::assertArrayHasKey('contact', $results->stepFailures, 'the dependent step is reported too');
-        self::assertSame([], $cc->contacts, 'no contact may be written without resolved relations');
+        self::assertSame([], $cc->contacts, 'no contact may be written with an unresolved relation');
+        self::assertSame(1, $results->contact?->getFailedCount(), 'the contact failed as a record');
 
-        // Nothing was saved at all — the file may not even exist.
+        // Every contact failed, so saveState refuses the watermark and the whole
+        // window is re-covered once the CRM recovers.
         $state = is_file($this->stateFile)
             ? (array) json_decode((string) file_get_contents($this->stateFile), true)
             : [];
-        self::assertArrayNotHasKey('contact', $state, 'the gated step must not advance its watermark');
+        self::assertArrayNotHasKey('contact', $state, 'a step where everything failed must not advance');
         self::assertArrayNotHasKey('account', $state);
     }
 
-
-    public function testAccountStepWhereEveryRecordFailedAlsoGatesContacts(): void
+    public function testUnresolvableRelationFailsOnlyTheContactsThatNeedIt(): void
     {
-        // The gate must not key on "the drain threw": a step in which every record
-        // failed produced no relation maps either, and it is the same condition
-        // saveState() already refuses to advance the watermark for. Otherwise
-        // contacts write raw CRM foreign keys and the run reports itself clean.
+        // The case step-level gating could not express, in either direction: one
+        // account is unwritable, so contacts referencing it must fail — while
+        // contacts that don't reference it keep syncing. Gating the whole contact
+        // step on "the account step failed" stalled both, and gating on "the drain
+        // threw" missed this partial failure entirely and wrote raw ids for it.
         $crm = new FakeCrmAdapter(
-            contacts: [Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@t.com', 'company_id' => 'crm-a9'])],
-            accounts: [Account::fromArray(['id' => 'crm-a9', 'company_name' => 'Acme', 'external_id' => 'acme9'])],
+            contacts: [
+                Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@t.com', 'company_id' => 'crm-a9']),
+                Contact::fromArray(['id' => 'c2', 'full_name' => 'Jane', 'email' => 'jane@t.com', 'company_id' => 'crm-a8']),
+            ],
+            accounts: [
+                Account::fromArray(['id' => 'crm-a9', 'company_name' => 'Acme', 'external_id' => 'acme9']),
+                Account::fromArray(['id' => 'crm-a8', 'company_name' => 'Globex', 'external_id' => 'globex8']),
+            ],
         );
         $cc = new FakeCcAdapter();
         $cc->failAccountOn('acme9');
 
         $results = $this->engine($crm, $cc)->fullSync();
 
-        self::assertTrue($results->hasStepFailures(), 'an all-failed step must not report a clean run');
-        self::assertArrayHasKey('account', $results->stepFailures);
-        self::assertArrayHasKey('contact', $results->stepFailures, 'the dependent step is gated too');
-        self::assertSame([], $cc->contacts, 'no contact may be written with unresolved relations');
+        // A partial failure is reported per record, not as a step failure: the step
+        // ran and produced usable state, so nothing downstream should treat it as
+        // unusable — the individual records carry the bad news.
+        self::assertFalse($results->hasStepFailures());
+        self::assertSame(1, $results->account?->getFailedCount(), 'the unwritable account failed');
+        self::assertSame(1, $results->contact?->getFailedCount(), 'only the contact needing it failed');
 
-        $state = is_file($this->stateFile)
-            ? (array) json_decode((string) file_get_contents($this->stateFile), true)
-            : [];
-        self::assertArrayNotHasKey('contact', $state);
+        self::assertCount(1, $cc->contacts, 'the unaffected contact still synced');
+        $synced = array_values($cc->contacts)[0];
+        self::assertSame('jane@t.com', (string) $synced->get('email'));
+        // Resolved to the Daktela-side account identifier the on-the-fly sync
+        // created — not the raw CRM id "crm-a8" the fallback would have written.
+        self::assertSame('cc-account-1', (string) $synced->get('account'), 'and its relation resolved');
+    }
+
+    public function testAccountGenuinelyAbsentFromTheCrmPassesTheValueThrough(): void
+    {
+        // docs/03 step 5: when the referenced entity does not exist in the CRM at
+        // all — nothing failed, there is simply nothing to resolve to — the value
+        // passes through unchanged. This is the documented contract and must stay
+        // distinct from a failed resolution attempt.
+        $crm = new FakeCrmAdapter(
+            contacts: [Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@t.com', 'company_id' => 'crm-gone'])],
+        );
+        $cc = new FakeCcAdapter();
+
+        $results = $this->engine($crm, $cc)->fullSync();
+
+        self::assertSame(0, $results->contact?->getFailedCount());
+        self::assertCount(1, $cc->contacts);
+        self::assertSame(
+            'crm-gone',
+            (string) array_values($cc->contacts)[0]->get('account'),
+            'unresolved value passed through',
+        );
     }
 
     private function engine(
@@ -338,12 +373,23 @@ final class FullSyncTest extends TestCase
     }
 }
 
-/** CRM whose account listing fails (503, revoked scope, …) while contacts are fine. */
+/**
+ * CRM whose account endpoint is down (503, revoked scope, …) while contacts are fine. The outage takes both routes to an
+ * account: the listing the account step drains, and the per-id lookup the
+ * on-demand resolver falls back to. A fake that broke only the listing would
+ * leave findAccount() returning null, which the contract defines as "this
+ * account does not exist" — a different case with a different correct outcome.
+ */
 final class FailingAccountsCrmAdapter extends FakeCrmAdapter
 {
     public function iterateAccounts(?\DateTimeImmutable $since = null, int $offset = 0): \Generator
     {
         throw new \RuntimeException('CRM /organizations returned 503');
         yield from []; // @phpstan-ignore-line unreachable, keeps this a Generator
+    }
+
+    public function findAccount(string $id): ?Account
+    {
+        throw new \RuntimeException('CRM /organizations/' . $id . ' returned 503');
     }
 }

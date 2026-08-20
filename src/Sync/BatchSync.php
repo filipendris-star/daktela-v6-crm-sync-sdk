@@ -14,6 +14,7 @@ use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
 use Daktela\CrmSync\Exception\AdapterException;
 use Daktela\CrmSync\Exception\ConfigurationException;
+use Daktela\CrmSync\Exception\MappingException;
 use Daktela\CrmSync\Exception\NotSupportedException;
 use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
@@ -49,21 +50,6 @@ final class BatchSync
     /** @var array<string, string|null> "offset:firstRowId" of the previous export batch per key (write-back spin guard) */
     private array $exportSpinGuard = [];
 
-    /** @var array<string, int> Consecutive record-less cursor pages in the current drain, per key */
-    private array $emptyCursorPages = [];
-
-    /**
-     * Upper bound on consecutive record-less pages within one drain. A filtered
-     * search may legitimately return many (every row on the page filtered out
-     * server-side), so this is deliberately far above any real scan — it exists
-     * only to stop a runaway adapter that keeps issuing fresh tokens without ever
-     * finishing. Set high on purpose: tripping it splits the drain across runs, and
-     * a drain finishing in a later run stamps that run's start time as the
-     * watermark, so a false positive would cost more than the runaway it guards.
-     */
-    private const MAX_EMPTY_CURSOR_PAGES = 10000;
-
-
     private bool $forceFullSync = false;
 
     private ?SyncLedgerInterface $ledger = null;
@@ -93,8 +79,6 @@ final class BatchSync
         $this->offsets = [];
         $this->cursors = [];
         $this->exportSpinGuard = [];
-        // Drain-scoped: SyncEngine calls resetOffsets() before each step's drain.
-        $this->emptyCursorPages = [];
     }
 
     /**
@@ -131,7 +115,6 @@ final class BatchSync
     private function advanceCursor(
         string $key,
         CursorPage $page,
-        int $rows,
         SyncResult $result,
         ?string $requestedCursor,
     ): void {
@@ -142,29 +125,17 @@ final class BatchSync
         // treating it as the end would clear the cursor and let the watermark
         // advance over everything behind that token.
         if ($page->nextCursor !== null && $page->nextCursor === $requestedCursor) {
-            $this->emptyCursorPages[$key] = 0;
-
             throw AdapterException::cursorPaginationStalled($key, $requestedCursor);
         }
 
-        // A token that keeps advancing while never yielding a record is the other
-        // runaway shape (a `has_more` that is never false). Bounded per drain, and
-        // the counter is cleared when it trips so the next run gets a full attempt
-        // rather than being wedged at one page per run forever.
-        if ($rows === 0 && $page->nextCursor !== null) {
-            $seen = ($this->emptyCursorPages[$key] ?? 0) + 1;
-            $this->emptyCursorPages[$key] = $seen;
-
-            if ($seen >= self::MAX_EMPTY_CURSOR_PAGES) {
-                $this->emptyCursorPages[$key] = 0;
-                $this->cursors[$key] = $page->nextCursor;
-                $this->stateStore?->setCursor($key, $this->forceFullSync ? null : $page->nextCursor);
-
-                throw AdapterException::cursorDrainRunaway($key, $seen);
-            }
-        } else {
-            $this->emptyCursorPages[$key] = 0;
-        }
+        // A NEW token is trusted, however many record-less pages precede it: it is
+        // the adapter stating there is more to read, and "runaway or just a large
+        // sparsely-matching set?" cannot be decided from here — a filtered search
+        // can legitimately scan thousands of pages that yield nothing. Capping it
+        // does not help either: the cap has to persist the cursor and rethrow, so
+        // the next run resumes and burns the same allowance again, forever. An
+        // adapter whose has_more never turns false is a bug to fix in the adapter;
+        // bounding a run's total work belongs to the process that schedules it.
 
         $exhausted = $page->nextCursor === null;
         $next = $exhausted ? null : $page->nextCursor;
@@ -229,7 +200,7 @@ final class BatchSync
             foreach ($page->records as $contact) {
                 $result->addRecord($this->syncEntityToCc($contact, $mapping, 'contact', $upsertFn));
             }
-            $this->advanceCursor('contact', $page, count($page->records), $result, $cursor);
+            $this->advanceCursor('contact', $page, $result, $cursor);
         } else {
             $offset = $this->offsets['contact'] ?? 0;
             $count = 0;
@@ -294,7 +265,7 @@ final class BatchSync
             foreach ($page->records as $account) {
                 $processAccount($account);
             }
-            $this->advanceCursor('account', $page, count($page->records), $result, $cursor);
+            $this->advanceCursor('account', $page, $result, $cursor);
         } else {
             $offset = $this->offsets['account'] ?? 0;
             $count = 0;
@@ -610,6 +581,7 @@ final class BatchSync
         $departedCount = 0;
         $writeBackAttempted = 0;
         $firstId = null;
+        $firstRowDeparted = false;
         $exhausted = true;
         // Cap one export batch at the CC adapter's page size (read from the
         // instance so a redeclared constant is honored): the adapter pages
@@ -620,6 +592,7 @@ final class BatchSync
         $batchLimit = min($this->config->batchSize, $this->ccAdapter::ITERATE_PAGE_SIZE);
 
         foreach ($this->ccAdapter->iterateEntity($entry->source, $since, $offset, $entry->exportFilter, $entry->sinceField) as $row) {
+            $isFirstRow = $firstId === null;
             $firstId ??= isset($row['id']) ? (string) $row['id'] : '';
 
             [$record, $departed] = $this->exportCustomRecordToCrm($entry, $mapping, $row);
@@ -643,6 +616,10 @@ final class BatchSync
                 $writeBackAttempted++;
             }
 
+            if ($isFirstRow) {
+                $firstRowDeparted = $departed === true;
+            }
+
             $count++;
 
             if ($count >= $batchLimit) {
@@ -655,16 +632,18 @@ final class BatchSync
         $result->finish();
 
         // Spin guard: seeing the same first row again at the same offset means the
-        // write-back "succeeded" without actually removing records from the
+        // write-back reported success without the records actually leaving the
         // export_filter (it writes fields the filter doesn't check) — a
-        // configuration error. Abort the drain: any forward skip here would step
-        // over rows that genuinely departed mid-batch and slid down (permanent
-        // loss once the window advances), and continuing would re-serve the same
-        // batch forever. Throwing keeps the watermark (saveState never runs), so
-        // nothing is lost and the operator sees the error every run until the
-        // write_back/export_filter pairing is fixed. The guard binds offset AND
-        // row id (a repeat id at a different offset is legitimate movement), and
-        // ignores id-less rows.
+        // configuration error. The offset only advances by the rows that still
+        // match, so a batch where everything "departed" but nothing really did
+        // leaves the offset unchanged and re-serves the same rows forever: the
+        // drain never terminates. One batch cannot tell that apart from the
+        // legitimate case (rows genuinely left and the ones behind slid down into
+        // the same offset), which is why the check spans two batches and binds
+        // offset AND row id — a repeat id at a different offset is real movement.
+        // Aborting rather than skipping forward keeps rows that departed mid-batch
+        // from being stepped over, and throwing keeps the watermark (saveState
+        // never runs), so the operator sees this every run until it is fixed.
         $guardValue = ($firstId !== null && $firstId !== '') ? $offset . ':' . $firstId : null;
         if (!$exhausted && $guardValue !== null
             && ($this->exportSpinGuard[$offsetKey] ?? null) === $guardValue && $stillMatching < $count) {
@@ -675,19 +654,39 @@ final class BatchSync
 
             throw ConfigurationException::writeBackFilterMismatch($entry->name);
         }
-        // A set that fits in one batch never gets a second look, so the spin
-        // comparison above can't arm. Catch the same misconfiguration directly:
-        // every row succeeded, yet not one left the filtered set — the write_back
-        // is not touching a field the export_filter checks, so the rows keep
-        // re-entering the window (their `edited` was just bumped) and would be
-        // re-exported on every run forever.
-        // Fire only on evidence of misconfiguration: write-backs were actually
-        // attempted and not one of them wrote. Records whose write-back was never
-        // attempted (missing ids) or that failed for unrelated reasons must not be
-        // blamed on the config — that would wedge the slot on a transient error.
-        if ($exhausted && $writeBackAttempted > 0 && $departedCount === 0) {
+
+        // Second check, giving a single-batch drain the same verdict the comparison
+        // above reaches over two batches — without waiting for a second batch that
+        // a set this size never produces. Re-run the export query and see whether
+        // it still starts with the row we just processed.
+        //
+        // Deliberately the SAME query, with no narrowing added. Identifying the
+        // record instead does not work: the documented write_back convention
+        // rewrites the very field that identifies it (rename the lookup field with
+        // the CRM-id prefix), so a probe keyed on the pre-write-back id finds
+        // nothing whether or not the record left the filter, and reports success
+        // for the one configuration this exists to catch. Re-asking the original
+        // question needs no identity and no filter field the adapter might not
+        // support: if the first row is still first, the set did not shrink.
+        //
+        // Gated on the first row's write-back having actually written. Without that
+        // gate a transient failure on the first row — which legitimately leaves it
+        // in the set — would be blamed on the config and wedge the slot for good.
+        if ($exhausted && $firstRowDeparted && $firstId !== null && $firstId !== '') {
+            if ($this->exportSetStillStartsWith($entry, $since, $firstId)) {
+                $this->logger->error(
+                    'Custom entity "{name}" write_back did not remove record {id} from export_filter — fix the write_back/export_filter pairing',
+                    ['name' => $entry->name, 'id' => $firstId],
+                );
+
+                throw ConfigurationException::writeBackFilterMismatch($entry->name);
+            }
+        } elseif ($exhausted && $writeBackAttempted > 0 && $departedCount === 0) {
+            // No record's write-back wrote at all — e.g. a source whose write-back
+            // target applyExportWriteBack() does not support, where it only warns.
+            // Nothing ever leaves the filter, so the rows re-export every run.
             $this->logger->error(
-                'Custom entity "{name}" write_back left every exported record inside export_filter — fix the write_back/export_filter pairing',
+                'Custom entity "{name}" write_back wrote nothing for any exported record — fix the write_back/export_filter pairing',
                 ['name' => $entry->name],
             );
 
@@ -695,10 +694,9 @@ final class BatchSync
         }
 
         // Only a non-exhausted batch can be the "previous batch" of a legitimate
-        // spin comparison. Storing the guard on an exhausted batch would leave a
-        // stale "offset:id" behind after the drain completes, and a later drain
-        // starting with the same (e.g. persistently failing) first row would
-        // false-match it.
+        // comparison. Storing the guard on an exhausted batch would leave a stale
+        // "offset:id" behind after the drain completes, and a later drain starting
+        // with the same (e.g. persistently failing) first row would false-match it.
         $this->exportSpinGuard[$offsetKey] = $exhausted ? null : $guardValue;
 
         $this->offsets[$offsetKey] = $exhausted ? 0 : $offset + $stillMatching;
@@ -1040,10 +1038,81 @@ final class BatchSync
         }
     }
 
+    /**
+     * Does the export query still begin with $firstId?
+     *
+     * Re-runs the drain's own query — same source, same since, same export_filter,
+     * offset 0 — and compares the first row. Still first means the record did not
+     * leave the filtered set, so the same rows will re-export on every run.
+     *
+     * SCOPE, precisely. This catches a write_back that writes a field the
+     * export_filter does not check while leaving the record's identity alone — the
+     * case docs/02 calls out as undetectable in a single batch. It does NOT catch a
+     * write_back that rewrites the identity field (the rename convention docs/02
+     * prescribes) while the filter checks something else: the record stays in the
+     * set under a new id, so it is no longer "first" and this reports no problem.
+     * Detecting that needs the post-write-back identity, which in turn needs the
+     * interface to declare which field identifies a record. Until then the
+     * two-batch spin comparison above is the only cover for that shape.
+     *
+     * No narrowing filter is added, on purpose: a filter field the sync layer
+     * invents is one an adapter is free not to support, which would silently widen
+     * the query and blame the config for someone else's failure.
+     *
+     * A probe that cannot run is not evidence of anything, so a failing query is
+     * logged and treated as "no misconfiguration proven" rather than failing the
+     * drain — the CC side is already in trouble and the records are reported.
+     */
+    private function exportSetStillStartsWith(
+        \Daktela\CrmSync\Config\CustomEntitySyncConfig $entry,
+        ?\DateTimeImmutable $since,
+        string $firstId,
+    ): bool {
+        try {
+            foreach ($this->ccAdapter->iterateEntity($entry->source, $since, 0, $entry->exportFilter, $entry->sinceField) as $row) {
+                return isset($row['id']) && (string) $row['id'] === $firstId;
+            }
+        } catch (\Throwable $e) {
+            $this->logger->warning(
+                'Could not verify whether {name} records left export_filter: {error}',
+                ['name' => $entry->name, 'error' => $e->getMessage()],
+            );
+        }
+
+        return false;
+    }
+
+    /**
+     * Make sure every entity this one references is present in the relation map,
+     * auto-syncing the ones that are missing (docs/03: "How It Works", step 4).
+     *
+     * @throws MappingException when a referenced entity exists but syncing it
+     *   failed. The mapper's fallback for an unresolved value is to pass the raw
+     *   CRM foreign key through, which is correct only for the documented case of
+     *   an entity that is genuinely absent from the CRM (step 5). When the
+     *   resolution attempt itself failed — CRM unreachable, Daktela write
+     *   rejected — passing it through writes a raw CRM id into a Daktela relation
+     *   field and reports the record as synced. Failing this one record instead
+     *   keeps its siblings syncing.
+     *
+     *   Note what this does NOT do: the record is not retried automatically.
+     *   saveState() advances the watermark whenever any record succeeded (see
+     *   docs/07), so a failed record falls outside the next incremental window
+     *   until its source timestamp changes again or a forced full sync runs. The
+     *   choice here is therefore "absent and reported failed" over "present with
+     *   a wrong link and reported synced" — not "later" over "now".
+     */
     private function ensureMappingRelations(EntityInterface $entity, MappingCollection $mapping): void
     {
+        // Only the collection's own rules. Per-type (`types:`) rules are irrelevant
+        // here: forType() is applied on the activity path alone, which never calls
+        // this method, so its callers (accounts, contacts, and custom entities on
+        // the IMPORT side — the export path never calls it) map with
+        // the raw collection and FieldMapper never reads a `types:` rule. Resolving
+        // them would fail records over rules that produce no output for them.
         foreach ($mapping->mappings as $fieldMapping) {
-            if ($fieldMapping->relation === null) {
+            $relation = $fieldMapping->relation;
+            if ($relation === null) {
                 continue;
             }
 
@@ -1052,8 +1121,17 @@ final class BatchSync
                 continue;
             }
 
-            if (!isset($this->relationMaps[$fieldMapping->relation->entity][(string) $value])) {
-                $this->ensureCrmEntityInCc($fieldMapping->relation->entity, (string) $value);
+            if (isset($this->relationMaps[$relation->entity][(string) $value])) {
+                continue;
+            }
+
+            $record = $this->ensureCrmEntityInCc($relation->entity, (string) $value);
+            if ($record !== null && $record->status === SyncStatus::Failed) {
+                throw MappingException::relationResolutionFailed(
+                    $relation->entity,
+                    (string) $value,
+                    $record->errorMessage !== '' ? $record->errorMessage : 'unknown error',
+                );
             }
         }
     }

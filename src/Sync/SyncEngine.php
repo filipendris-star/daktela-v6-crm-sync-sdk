@@ -9,7 +9,6 @@ use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Config\SyncConfiguration;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Mapping\FieldMapper;
-use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\Transformer\TransformerRegistry;
 use Daktela\CrmSync\State\SyncLedgerInterface;
 use Daktela\CrmSync\State\SyncStateStoreInterface;
@@ -66,12 +65,17 @@ final class SyncEngine
      * $stepFailures, so neither a caller inspecting FullSyncResult nor a cron
      * wrapper checking an exit code can mistake the run for a success.
      *
-     * Returns false when the step failed, so steps that DEPEND on it can be
-     * gated instead of running against state it never produced.
+     * Steps are NOT gated on each other's outcome. A later step that needs a
+     * relation the account step would have mapped resolves it per record instead
+     * (BatchSync::ensureMappingRelations), and fails only the records it actually
+     * cannot resolve. Gating whole steps on "the account step failed" stalled
+     * every dependent entity for as long as one account was broken while still
+     * missing the case that motivated it — a PARTIAL account failure leaves the
+     * step "ok" and the relation map incomplete.
      *
      * @param callable(): void $drain
      */
-    private function runIsolated(string $entityType, SyncResult $result, \DateTimeImmutable $syncStartTime, callable $drain): bool
+    private function runIsolated(string $entityType, SyncResult $result, \DateTimeImmutable $syncStartTime, callable $drain): void
     {
         try {
             $drain();
@@ -79,9 +83,8 @@ final class SyncEngine
             $this->saveState($entityType, $syncStartTime, $result);
 
             // A step in which every record failed produced nothing usable — the
-            // same condition saveState() refuses to advance the watermark for. It
-            // must count as a failed step, or dependents would run against state it
-            // never produced and the run would report itself clean.
+            // same condition saveState() refuses to advance the watermark for.
+            // Reported so the run cannot look clean, but it gates nothing.
             if ($result->getTotalCount() > 0 && $result->getFailedCount() === $result->getTotalCount()) {
                 $message = sprintf('all %d records failed', $result->getFailedCount());
                 $this->logger->error('Sync step {entityType}: {message}', [
@@ -89,11 +92,7 @@ final class SyncEngine
                     'message' => $message,
                 ]);
                 $this->stepFailures[$entityType] = $message;
-
-                return false;
             }
-
-            return true;
         } catch (\Throwable $e) {
             $this->logger->error('Sync step {entityType} failed: {error}', [
                 'entityType' => $entityType,
@@ -102,53 +101,7 @@ final class SyncEngine
             $result->addRecord(new RecordResult($entityType, null, null, SyncStatus::Failed, $e->getMessage()));
             $result->finish();
             $this->stepFailures[$entityType] = $e->getMessage();
-
-            return false;
         }
-    }
-
-    /**
-     * True when a mapping resolves cross-entity references, i.e. it needs the
-     * relation maps the account step builds. Steps without any are independent and
-     * must keep running when the account step fails.
-     */
-    private function mappingUsesRelations(?MappingCollection $mapping): bool
-    {
-        if ($mapping === null) {
-            return false;
-        }
-
-        foreach ($mapping->mappings as $rule) {
-            if ($rule->relation !== null) {
-                return true;
-            }
-        }
-
-        foreach ($mapping->typeMappings as $typeRules) {
-            foreach ($typeRules as $rule) {
-                if ($rule->relation !== null) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Mark a step as not run because a step it depends on failed. No watermark is
-     * saved, so the skipped window is re-covered once the dependency recovers.
-     */
-    private function skipDependentStep(string $entityType, SyncResult $result, string $dependency): void
-    {
-        $message = sprintf('skipped: the %s step it depends on failed', $dependency);
-        $this->logger->error('Sync step {entityType} {message}', [
-            'entityType' => $entityType,
-            'message' => $message,
-        ]);
-        $result->addRecord(new RecordResult($entityType, null, null, SyncStatus::Failed, $message));
-        $result->finish();
-        $this->stepFailures[$entityType] = $message;
     }
 
     /**
@@ -184,9 +137,6 @@ final class SyncEngine
             $autoContactResult = null;
             $contactResult = null;
             $activityResult = null;
-            // No account step to depend on (entity disabled) is not a failure:
-            // step 2 builds the relation maps directly in that case.
-            $accountStepOk = true;
 
             // Step 1: Sync accounts first (builds relation maps)
             if ($this->config->isEntityEnabled('account')) {
@@ -195,7 +145,7 @@ final class SyncEngine
                 $syncStartTime = new \DateTimeImmutable();
                 $accountResult = new SyncResult();
                 $autoContactResult = new SyncResult();
-                $accountStepOk = $this->runIsolated('account', $accountResult, $syncStartTime, function () use (&$accountResult, &$autoContactResult, $onBatch): void {
+                $this->runIsolated('account', $accountResult, $syncStartTime, function () use (&$accountResult, &$autoContactResult, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncAccounts();
                         if ($onBatch !== null) {
@@ -223,15 +173,6 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $contactResult = new SyncResult();
-                if (!$accountStepOk && $this->mappingUsesRelations($this->config->getMapping('contact'))) {
-                    // Contacts that resolve account references need the relation maps
-                    // step 1 builds. Running now would write raw CRM foreign keys
-                    // into Daktela (the resolver falls back to the unmapped value)
-                    // and then advance the contact watermark over them — a wrong
-                    // link that no later run would ever revisit. A mapping with no
-                    // relations has no such dependency and still runs.
-                    $this->skipDependentStep('contact', $contactResult, 'account');
-                } else {
                 $this->runIsolated('contact', $contactResult, $syncStartTime, function () use (&$contactResult, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncContacts();
@@ -241,7 +182,6 @@ final class SyncEngine
                         $contactResult->mergeCounts($batch);
                     } while (!$batch->isExhausted());
                 });
-                }
             }
 
             // Step 4: Sync activities
@@ -250,10 +190,6 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $activityResult = new SyncResult();
-                if (!$accountStepOk && $this->mappingUsesRelations($this->config->getMapping('activity'))) {
-                    // Only when the activity mapping actually resolves relations.
-                    $this->skipDependentStep('activity', $activityResult, 'account');
-                } else {
                 $this->runIsolated('activity', $activityResult, $syncStartTime, function () use (&$activityResult, $activityTypes, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncActivities($activityTypes);
@@ -263,7 +199,6 @@ final class SyncEngine
                         $activityResult->mergeCounts($batch);
                     } while (!$batch->isExhausted());
                 });
-                }
             }
 
             // Step 5: Sync configured custom entities. Runs after typed slots so relation maps
@@ -287,12 +222,6 @@ final class SyncEngine
                 $this->batchSync->resetOffsets();
                 $syncStartTime = new \DateTimeImmutable();
                 $entryResult = new SyncResult();
-                if (!$accountStepOk && $this->mappingUsesRelations($mapping)) {
-                    // Only when this entry's mapping actually resolves relations.
-                    $this->skipDependentStep("custom:{$customEntry->name}", $entryResult, 'account');
-                    $customEntityResults[$customEntry->name] = $entryResult;
-                    continue;
-                }
                 $this->runIsolated("custom:{$customEntry->name}", $entryResult, $syncStartTime, function () use (&$entryResult, $customEntry, $mapping, $onBatch): void {
                     do {
                         $batch = $this->batchSync->syncCustomEntity($customEntry, $mapping);

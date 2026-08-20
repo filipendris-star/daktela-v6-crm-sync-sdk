@@ -13,9 +13,11 @@ namespace Daktela\CrmSync\State;
  * exists for cannot search activities server-side, so the adapter's
  * find-then-upsert cannot locate that record — only the ledger knows its id.
  *
- * A ledger that does not implement this makes the webhook path fall back to
- * skipping events for records it has already exported: one CRM record per
- * activity (never duplicates), but frozen at the first event's payload.
+ * A ledger that does not implement this makes the webhook path hand every event
+ * to the adapter's own upsert instead. What that costs depends on the CRM: one
+ * that can search activities finds and updates the record in place (no loss),
+ * while one that cannot has no way to locate it and adds another record per
+ * event. Implementing this interface is the fix for the latter.
  */
 interface SyncLedgerLookupInterface extends SyncLedgerInterface
 {

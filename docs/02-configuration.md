@@ -93,15 +93,29 @@ adapter implementing `SupportsCustomEntityWriteInterface`.
 | `write_back` | list | Inline mapping rules applied CRM→CC after create (typically stamps the prefixed CRM id back, which removes the record from the export filter) |
 
 The write_back rules **must** rewrite a field the `export_filter` checks (the
-documented convention: rename the lookup field with the CRM-id prefix). The
-export pagination relies on successful write-backs removing records from the
-filtered set. Two misconfigurations are detected at runtime and abort the drain
-with a configuration error (the sync window is kept, so nothing is lost): a
-write_back that performs no CC write at all, and one whose records keep
-re-appearing across batches. A write_back that *does* write but touches only
-fields the export_filter ignores cannot be detected inside a single batch — with
-a filtered set smaller than one batch it will silently re-export the same records
-on every run, so verify the pairing when you configure it.
+documented convention: stamp the lookup field with the CRM-id prefix). The export
+pagination relies on successful write-backs removing records from the filtered
+set, and the filter is what keeps the export one-way: it selects only records
+created in Daktela, excluding everything the CRM owns.
+
+Three misconfigurations abort the drain with a configuration error (the sync
+window is kept, so nothing is lost): a write_back that performs no CC write at
+all; one whose records keep re-appearing across batches; and one that writes a
+field the `export_filter` does not check while leaving the record's identity
+alone.
+
+One shape is **not** detected: a write_back that rewrites the identity field
+itself while the `export_filter` checks a different field. The record stays in the
+set under a new identity, so a completed single-batch drain cannot tell it apart
+from a record that legitimately left. With a filtered set larger than one batch
+the cross-batch check catches it; below that it will re-export the same records
+every run, so verify the pairing when you configure it.
+
+**The prefix appears in three places and nothing ties them together**: the
+`write_back` transformer that stamps it, the `export_filter` pattern that excludes
+it, and the *import* mapping that must regenerate the same value so a record
+coming back from the CRM lands on the record that was exported rather than
+creating a second one. Keep all three in step.
 
 ```yaml
 sync:

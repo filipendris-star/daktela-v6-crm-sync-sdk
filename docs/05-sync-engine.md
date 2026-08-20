@@ -204,7 +204,7 @@ $engine = new SyncEngine(
 
 **When state is saved:**
 
-State is saved after all batches for an entity type have been processed, but only if zero records failed across the entire run. If any record fails in any batch, the timestamp is not updated — the next run retries from the same point. See the [Production Deployment](09-production-deployment.md) guide for details on safety guarantees.
+State is saved after all batches for an entity type have been processed, unless *every* record failed — that is the only case in which the timestamp is withheld and the next run re-covers the same window. A **partial** failure still advances the timestamp, so individually failed records fall outside the next incremental window until their source timestamp changes again or a forced full sync runs; watch `SyncResult` for them if you need to re-drive them. See the [Production Deployment](09-production-deployment.md) guide for details on safety guarantees.
 
 ## Auto-Create Contact from Account
 

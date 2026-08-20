@@ -191,7 +191,36 @@ When syncing contacts, you often need to resolve references to other entities. F
 2. The engine builds a resolution map: `CRM account.id → Daktela account.name`
 3. When syncing contacts, the mapper sees `company_id = "crm-acc-123"` and resolves it to `account = "acme"` using the map
 4. If a referenced entity is missing from the map, the engine auto-fetches it from the CRM and syncs it on-the-fly (with recursion protection)
-5. If a value still cannot be resolved (entity not found in CRM), the original value is passed through unchanged
+5. If the entity does not exist in the CRM, the original value is passed through unchanged
+6. If the entity exists but syncing it **failed** (CRM unreachable, Daktela write rejected), the referencing record fails instead
+
+Two cases fall outside 5 and 6 and still pass the value through: no mapping is
+configured for the referenced entity type, and the recursion guard declining a
+reference already being resolved higher up the stack. Neither attempted a
+resolution, so neither is reported as a failure.
+
+Steps 5 and 6 look the same from the mapper's side and must not be treated the
+same. Passing an unresolved value through is only correct when there is genuinely
+nothing to resolve to; doing it after a *failed* attempt writes a raw CRM foreign
+key into a Daktela relation field and reports the record as synced, so the
+watermark advances past a wrong link no later run revisits.
+
+Failing the individual record instead keeps this scale-free: unaffected records
+in the same batch keep syncing.
+
+Be aware of what a failed record does and does not get you. It is reported in
+`SyncResult` and it is *not* written with a bad link — but it is not retried
+automatically either: the watermark still advances as long as some record
+succeeded (see [Error Handling](07-error-handling.md)), so the record stays
+outside the incremental window until its source timestamp changes again or a
+forced full sync runs. The trade is "absent and reported" over "present and
+silently wrong". If a host needs the stronger guarantee, it should watch
+`SyncResult` for failed records and re-drive them.
+
+Steps are not gated on each other for this — gating the whole contact step on
+"the account step failed" stalls every contact for as long as one account is
+broken, and still misses a *partial* account failure, which is the case that
+actually produces unresolved references.
 
 ### Using fullSync()
 
@@ -252,12 +281,38 @@ date: a Prague summer time converts at +2 h, a winter time at +1 h.
 ```
 
 Fields the `from` format leaves unspecified are anchored to zero (not filled
-from the current time). `to_tz` only applies when a time-of-day is actually
-present: a date is not an instant, so for date-only input the conversion is
-skipped and the date passes through unshifted instead of moving a day backward
-east of UTC. This is decided by the `from` format's time specifiers
-(`H`/`G`/`h`/`g`/`i`/`s`/`v`/`u`/`U`) and, when a value doesn't match that format and
-falls back to generic parsing, by whether the value itself parsed a time.
+from the current time).
+
+**`to_tz` converts what `from` declares.** Two conditions, both read off the
+config: `from` must parse a time of day, and the value must actually match it.
+Nothing about the value is inspected or guessed.
+
+The defaults are Daktela's own shape — `from: 'Y-m-d H:i:s'`, which is what the
+v6 API emits for every `ItemDescription::DateTime` field — so the common CC→CRM
+case needs no extra configuration beyond the target zone.
+
+For anything else, **declare the format the source emits** and it converts:
+
+| Source shape | `from` |
+|---|---|
+| `2024-06-01 14:30:00` (Daktela) | `Y-m-d H:i:s` (default) |
+| `2024-06-01T14:30:00+02:00` or `…Z` | `Y-m-d\TH:i:sP` |
+| `1717245000` (unix epoch) | `U` |
+| `01.06.2024 14:30:00` | `d.m.Y H:i:s` |
+
+Two rules follow, and they are the whole of the behaviour:
+
+- **A value that does not match `from`** is still parsed generically and
+  reformatted (legacy behaviour), but never zone-shifted. If timestamps come out
+  unconverted, `from` does not describe the data — fix `from`.
+- **A date-only `from`** (`Y-m-d`) never converts, whatever an individual value
+  contains. A date is not an instant: shifting `2026-08-19` into UTC would emit
+  `2026-08-18` on any instance east of UTC while silently "working" west of it.
+
+This is declared rather than detected on purpose. Whether an arbitrary value is
+an instant is not decidable — PHP's parser reports hour, minute and second all
+zero for both `today` and a real midnight, so a calendar date and a genuine
+midnight are indistinguishable after parsing. `from` already carries the answer.
 
 ### `phone_normalize`
 Strips all non-digit/non-plus characters and optionally prepends `+` for E.164 format.

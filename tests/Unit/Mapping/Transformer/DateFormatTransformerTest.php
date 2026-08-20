@@ -181,12 +181,65 @@ final class DateFormatTransformerTest extends TestCase
         self::assertSame('2024-06-01', $result);
     }
 
-    #[\PHPUnit\Framework\Attributes\DataProvider('rfc2822DateTimeProvider')]
-    public function testRfc2822DateTimesAreStillConverted(string $value, string $expected): void
+    public function testCanonicalMidnightIsConverted(): void
     {
-        // A weekday name does not make a value date-only: RFC 2822 / HTTP dates are
-        // the canonical email Date: header shape and carry a real time, which must
-        // still be shifted into the target zone.
+        // A real midnight is an instant like any other, and matching `from` is all
+        // it takes. Worth pinning because "does this value carry a time?" cannot be
+        // answered from the value: date_parse() reports hour/minute/second all zero
+        // for both "today" and an explicit midnight, so any rule reading the value
+        // has to get one of them wrong. This one reads the format instead.
+        $params = [
+            'from' => 'Y-m-d H:i:s',
+            'from_tz' => 'Europe/Prague',
+            'to_tz' => 'UTC',
+        ];
+
+        self::assertSame('2024-05-31', $this->transformer->transform('2024-06-01 00:00:00', $params + ['to' => 'Y-m-d']));
+        self::assertSame('22:00', $this->transformer->transform('2024-06-01 00:00:00', $params + ['to' => 'H:i']));
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('declaredFormatProvider')]
+    public function testAnyFormatConvertsOnceItIsDeclared(string $from, string $value, string $expected): void
+    {
+        // The contract: declare what the source emits and it converts. No notation
+        // is privileged and nothing is inferred from the value — an offset-bearing
+        // ISO timestamp, a unix epoch and a dotted European datetime all work the
+        // same way, by saying so in `from`.
+        //
+        // A value carrying its own offset overrides from_tz, which is why from_tz is
+        // deliberately wrong for those cases: 12:30 UTC is 14:30 in Prague.
+        $result = $this->transformer->transform($value, [
+            'from' => $from,
+            'to' => 'Y-m-d H:i',
+            'from_tz' => 'America/New_York',
+            'to_tz' => 'Europe/Prague',
+        ]);
+
+        self::assertSame($expected, $result, sprintf('"%s" declared as "%s" must convert', $value, $from));
+    }
+
+    /** @return iterable<string, array{string, string, string}> */
+    public static function declaredFormatProvider(): iterable
+    {
+        yield 'iso with numeric offset' => ['Y-m-d\TH:i:sP', '2024-06-01T12:30:00+00:00', '2024-06-01 14:30'];
+        // One declared format covers both offset notations: P parses "Z" as well.
+        yield 'iso with Z' => ['Y-m-d\TH:i:sP', '2024-06-01T12:30:00Z', '2024-06-01 14:30'];
+        // Escaping it (\Z) declares a literal instead, so no zone is parsed and the
+        // value is read in from_tz. The format means exactly what it says.
+        yield 'escaped Z is a literal' => ['Y-m-d\TH:i:s\Z', '2024-06-01T12:30:00Z', '2024-06-01 18:30'];
+        yield 'unix epoch' => ['U', '1717245000', '2024-06-01 14:30'];
+        yield 'dotted european' => ['d.m.Y H:i:s', '01.06.2024 12:30:00', '2024-06-01 18:30'];
+        yield 'offset-bearing midnight' => ['Y-m-d\TH:i:sP', '2024-06-01T00:00:00+02:00', '2024-06-01 00:00'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('nonMatchingValueProvider')]
+    public function testValuesNotMatchingTheDeclaredFormatAreNeverShifted(string $value, string $expected): void
+    {
+        // A value that did not match `from` is of unknown shape, and no rule reading
+        // it can decide whether it is an instant. It is still parsed generically and
+        // reformatted (legacy behaviour), but never zone-shifted. If real timestamps
+        // land here, `from` does not describe the data — see
+        // testAnyFormatConvertsOnceItIsDeclared for the fix.
         $result = $this->transformer->transform($value, [
             'from' => 'Y-m-d H:i:s',
             'to' => 'Y-m-d H:i',
@@ -194,78 +247,28 @@ final class DateFormatTransformerTest extends TestCase
             'to_tz' => 'UTC',
         ]);
 
-        self::assertSame($expected, $result, sprintf('value "%s" carries a time and must convert', $value));
+        self::assertSame($expected, $result, sprintf('value "%s" did not match `from` and must not shift', $value));
     }
 
     /** @return iterable<string, array{string, string}> */
-    public static function rfc2822DateTimeProvider(): iterable
+    public static function nonMatchingValueProvider(): iterable
     {
-        // 14:30 Prague (CEST, +2) = 12:30 UTC
-        yield 'rfc 2822 without offset' => ['Sat, 01 Jun 2024 14:30:00', '2024-06-01 12:30'];
-        // an explicit offset in the value wins over from_tz: 14:30+02:00 = 12:30 UTC
-        yield 'rfc 2822 with offset' => ['Sat, 01 Jun 2024 14:30:00 +0200', '2024-06-01 12:30'];
-        yield 'relative keyword with a time' => ['2024-06-01 09:00:00 GMT', '2024-06-01 09:00'];
+        yield 'iso with T separator' => ['2024-06-01T14:30:00', '2024-06-01 14:30'];
+        yield 'iso basic' => ['20240601T143000', '2024-06-01 14:30'];
+        yield 'rfc 2822 datetime' => ['Sat, 01 Jun 2024 14:30:00', '2024-06-01 14:30'];
+        yield 'rfc 2822 date only' => ['Sat, 01 Jun 2024', '2024-06-01 00:00'];
+        yield 'plain iso date' => ['2024-06-01', '2024-06-01 00:00'];
+        yield 'textual date' => ['1 Jun 2024', '2024-06-01 00:00'];
+        yield 'meridiem time' => ['2024-06-01 2pm', '2024-06-01 14:00'];
+        yield 'dotted time' => ['01-Jun-2024 14.30', '2024-06-01 14:30'];
     }
 
-    #[\PHPUnit\Framework\Attributes\DataProvider('timeCarryingFallbackValuesProvider')]
-    public function testFallbackParseStillConvertsWhenValueCarriesTime(string $value): void
+    public function testUnparseableValuePassesThrough(): void
     {
-        // The date-only rule must key on what was actually parsed, not on a colon
-        // pattern: compact ISO 8601 (iCalendar DTSTART), "2pm" and dotted times
-        // all carry a time and must be converted.
-        $result = $this->transformer->transform($value, [
-            'from' => 'Y-m-d H:i:s',
-            'to' => 'H:i',
-            'from_tz' => 'Europe/Prague',
-            'to_tz' => 'UTC',
-        ]);
-
-        self::assertSame('12:30', $result, sprintf('value "%s" carries a time and must convert', $value));
-    }
-
-    /** @return iterable<string, array{string}> */
-    public static function timeCarryingFallbackValuesProvider(): iterable
-    {
-        yield 'iso extended' => ['2024-06-01T14:30:00'];
-        yield 'iso basic' => ['20240601T143000'];
-        yield 'iso basic without separator' => ['20240601143000'];
-        yield 'dotted time' => ['01-Jun-2024 14.30'];
-    }
-
-    #[\PHPUnit\Framework\Attributes\DataProvider('dateOnlyFallbackValuesProvider')]
-    public function testFallbackParseLeavesDateOnlyValuesUnshifted(string $value, string $expected): void
-    {
-        // date_parse sets hour = 0 as a side effect of a relative token, so these
-        // carry no time and must not be converted — an RFC-2822 date ("Sat, 01 Jun
-        // 2024") is routine in email/CRM exports.
-        $result = $this->transformer->transform($value, [
+        self::assertSame('not a date', $this->transformer->transform('not a date', [
             'from' => 'Y-m-d H:i:s',
             'to' => 'Y-m-d',
-            'from_tz' => 'Europe/Prague',
             'to_tz' => 'UTC',
-        ]);
-
-        self::assertSame($expected, $result, sprintf('value "%s" is date-only and must not shift', $value));
-    }
-
-    /** @return iterable<string, array{string, string}> */
-    public static function dateOnlyFallbackValuesProvider(): iterable
-    {
-        yield 'rfc 2822 date-only' => ['Sat, 01 Jun 2024', '2024-06-01'];
-        yield 'plain iso date' => ['2024-06-01', '2024-06-01'];
-        yield 'textual date' => ['1 Jun 2024', '2024-06-01'];
-        yield 'bare relative keyword' => ['today', (new \DateTimeImmutable('today', new \DateTimeZone('Europe/Prague')))->format('Y-m-d')];
-    }
-
-    public function testFallbackParseConvertsMeridiemValues(): void
-    {
-        $result = $this->transformer->transform('2024-06-01 2pm', [
-            'from' => 'Y-m-d H:i:s',
-            'to' => 'H:i',
-            'from_tz' => 'Europe/Prague',
-            'to_tz' => 'UTC',
-        ]);
-
-        self::assertSame('12:00', $result);
+        ]));
     }
 }

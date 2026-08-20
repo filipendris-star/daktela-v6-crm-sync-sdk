@@ -6,6 +6,9 @@ namespace Daktela\CrmSync\Mapping\Transformer;
 
 final class DateFormatTransformer implements ValueTransformerInterface
 {
+    /** Daktela's datetime format — the default, and what the v6 API always emits. */
+    private const DEFAULT_FROM_FORMAT = 'Y-m-d H:i:s';
+
     public function getName(): string
     {
         return 'date_format';
@@ -26,10 +29,27 @@ final class DateFormatTransformer implements ValueTransformerInterface
      * Using named zones (not fixed offsets) means DST is handled per-date, so a
      * summer time converts at +2h and a winter time at +1h automatically.
      *
-     * to_tz only applies when the `from` format carries time-of-day. A date-only
-     * value is not an instant — shifting it across zones would move the date a
-     * whole day backward east of UTC while silently "working" west of it — so for
-     * date-only formats the conversion is skipped and the date passes through.
+     * `from` is the contract, and to_tz applies on exactly two conditions, both
+     * read off it: the format parses a time of day, and the value actually matched
+     * it. Nothing about the value itself is inspected or inferred.
+     *
+     * That is deliberate. Zone conversion needs an unambiguous instant, and asking
+     * a value of unknown shape whether it is one is not answerable — date_parse()
+     * reports hour=0/minute=0/second=0 for both "today" and a real midnight. Every
+     * attempt to decide it from the data got some class of value wrong: naive
+     * midnights, epochs, compact ISO, weekday-prefixed dates, offset-bearing ISO.
+     * The format already carries the answer, so it is simply declared instead.
+     *
+     * The practical rule for configs: **declare the format your source emits.**
+     * ISO-8601 with an offset converts under `from: 'Y-m-d\TH:i:sP'`; a unix
+     * timestamp under `from: 'U'`; a dotted European datetime under
+     * `from: 'd.m.Y H:i:s'`. A value that does not match `from` is still parsed
+     * generically and reformatted (legacy behaviour) but never zone-shifted — if
+     * timestamps come out unconverted, `from` does not describe the data.
+     *
+     * A date-only format never converts, whatever the value holds: a date is not an
+     * instant, and shifting "2026-08-19" would move it a day backward east of UTC
+     * while silently "working" west of it.
      *
      * @param array<string, mixed> $params
      */
@@ -39,17 +59,13 @@ final class DateFormatTransformer implements ValueTransformerInterface
             return $value;
         }
 
-        $from = (string) ($params['from'] ?? 'Y-m-d H:i:s');
+        $from = (string) ($params['from'] ?? self::DEFAULT_FROM_FORMAT);
         $to = (string) ($params['to'] ?? 'Y-m-d');
 
         $fromTz = new \DateTimeZone(isset($params['from_tz'])
             ? (string) $params['from_tz']
             : date_default_timezone_get());
         $toTz = isset($params['to_tz']) ? new \DateTimeZone((string) $params['to_tz']) : null;
-
-        if ($toTz !== null && !$this->formatCarriesTime($from)) {
-            $toTz = null;
-        }
 
         // Anchor unspecified fields to zero (via `|`) instead of letting
         // createFromFormat fill them from "now": with to_tz set, a date-only
@@ -58,6 +74,8 @@ final class DateFormatTransformer implements ValueTransformerInterface
         $anchoredFrom = str_contains($from, '!') || str_contains($from, '|') ? $from : $from . '|';
 
         $date = \DateTimeImmutable::createFromFormat($anchoredFrom, (string) $value, $fromTz);
+        $matchedFormat = $date !== false;
+
         if ($date === false) {
             // Try parsing as any recognizable format
             try {
@@ -65,20 +83,14 @@ final class DateFormatTransformer implements ValueTransformerInterface
             } catch (\Exception) {
                 return $value;
             }
+        }
 
-            // The date-only rule above keys on the configured format, but this
-            // path accepted a value the format did not describe: re-apply the
-            // rule to the value itself, or a date-only value slipping through a
-            // datetime format would still shift by a whole day.
-            //
-            // date_parse reports what it actually parsed, so compact ISO
-            // ("20240601T143000"), "2pm", "14.30" and RFC 2822 datetimes
-            // ("Sat, 01 Jun 2024 14:30:00" — the standard email Date: header) are
-            // all recognised as carrying a time, while date-only values in any of
-            // those notations are not.
-            if ($toTz !== null && !$this->valueCarriesTime((string) $value)) {
-                $toTz = null;
-            }
+        // Convert only what `from` vouches for: it must parse a time of day, and
+        // the value must have actually matched it. A value that fell through to the
+        // generic parser is of unknown shape, and no rule reading it can decide
+        // whether it is an instant — so it is reformatted, never shifted.
+        if ($toTz !== null && !($matchedFormat && $this->formatCarriesTime($from))) {
+            $toTz = null;
         }
 
         if ($toTz !== null) {
@@ -89,31 +101,9 @@ final class DateFormatTransformer implements ValueTransformerInterface
     }
 
     /**
-     * True when the VALUE itself parsed a time of day.
-     *
-     * `hour !== false` alone is not enough: date_parse sets hour/minute/second to
-     * 0 for a value that names only a date ("Sat, 01 Jun 2024", "today"). An
-     * all-zero time therefore means "no time was given" — the one value it
-     * misreads is an explicit midnight, which reaches this path only when it did
-     * not match the configured format, and treating it as a date is the safer
-     * reading anyway (no date can shift).
-     */
-    private function valueCarriesTime(string $value): bool
-    {
-        $parsed = date_parse($value);
-        $hour = $parsed['hour'] ?? false;
-
-        if ($hour === false) {
-            return false;
-        }
-
-        return $hour !== 0 || ($parsed['minute'] ?? 0) !== 0 || ($parsed['second'] ?? 0) !== 0;
-    }
-
-    /**
-     * True when the format parses a time of day (hour/minute/second/fraction or
-     * a unix timestamp). Backslash-escaped characters are literals, not
-     * specifiers, and don't count.
+     * True when the format parses a time of day (hour/minute/second/fraction or a
+     * unix timestamp). Backslash-escaped characters are literals, not specifiers,
+     * and don't count.
      */
     private function formatCarriesTime(string $format): bool
     {

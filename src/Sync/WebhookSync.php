@@ -7,7 +7,6 @@ namespace Daktela\CrmSync\Sync;
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
-use Daktela\CrmSync\State\SyncLedgerLookupInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
@@ -16,9 +15,11 @@ use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Entity\Contact;
 use Daktela\CrmSync\Entity\EntityInterface;
+use Daktela\CrmSync\Exception\RecordNotFoundException;
 use Daktela\CrmSync\Mapping\FieldMapper;
 use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\NestedValue;
+use Daktela\CrmSync\State\SyncLedgerLookupInterface;
 use Daktela\CrmSync\Sync\Result\RecordResult;
 use Daktela\CrmSync\Sync\Result\SyncResult;
 use Daktela\CrmSync\Sync\Result\SyncStatus;
@@ -185,24 +186,67 @@ final class WebhookSync
             // activities, a plain ledger leaves upsert unable to locate the record,
             // so follow-up events add another one. Implementing
             // SyncLedgerLookupInterface is the fix.
-            $synced = $knownCrmId !== null
-                ? $this->updateOrRecreate($knownCrmId, $typeMapping->lookupField, $mappedActivity)
-                : $this->crmAdapter->upsertActivity($typeMapping->lookupField, $mappedActivity);
-
-            // Record in the ledger so a later batch run (create-without-lookup
-            // when a ledger is set) skips this activity instead of duplicating it.
-            // Only on first export: re-recording every follow-up event would break
-            // ledgers whose store has a unique key on (entity_type, cc_id).
-            // First export always records. Afterwards, only re-record when we knew
-            // an id and it changed (the record was re-created after being deleted
-            // CRM-side) — never blindly, or a ledger whose store has a unique key
-            // on (entity_type, cc_id) would throw on the second event.
-            $recreated = $knownCrmId !== null && $synced->getId() !== $knownCrmId;
-            if ($ledger !== null && $id !== '' && (!$alreadySynced || $recreated)) {
-                $ledger->recordSynced('activity', $id, $synced->getId());
+            if ($knownCrmId !== null) {
+                [$synced, $recreated] = $this->updateOrRecreate(
+                    $knownCrmId,
+                    $typeMapping->lookupField,
+                    $mappedActivity,
+                );
+            } else {
+                $synced = $this->crmAdapter->upsertActivity($typeMapping->lookupField, $mappedActivity);
+                $recreated = false;
             }
 
-            $result->addRecord(new RecordResult('activity', $id, $synced->getId(), SyncStatus::Updated));
+            // Which CRM record this activity now lives in, keyed on the branch that
+            // actually ran. Only an in-place update leaves it where the ledger
+            // already points; there the id comes from the ledger, NOT from what
+            // updateActivity() returned — the interface says nothing about echoing
+            // the id back, and an adapter that returns the entity it was handed
+            // reports none. Every other path (first export, upsert on a ledger that
+            // cannot name the record, re-create) produced the id we just wrote, so
+            // it must be reported. Keying this on $alreadySynced instead nulled the
+            // targetId of every follow-up event handled through upsert.
+            $crmId = $knownCrmId !== null && !$recreated ? $knownCrmId : $synced->getId();
+
+            // Record in the ledger so a later batch run (create-without-lookup when
+            // a ledger is set) skips this activity instead of duplicating it. Write
+            // once per CRM record: on first export, and again only when this run
+            // genuinely re-created it (a fact returned by updateOrRecreate, not
+            // inferred). Re-recording every follow-up event would throw on ledgers
+            // whose store has a unique key on (entity_type, cc_id).
+            //
+            // A write that named no record is still recorded, with a null id. It
+            // reads as "exported, id unknown", which is exactly what happened, and
+            // it is what keeps the batch path (which gates on hasSynced alone) from
+            // creating yet another copy on the next run. Refusing to record instead
+            // — failing the event to make the adapter's fault loud — left no row at
+            // all and produced strictly MORE duplicates than it prevented.
+            //
+            // A null row must not be permanent, though: without the third clause
+            // below, findCrmId() keeps returning null, so $knownCrmId stays null,
+            // $recreated stays false, and the row is never revisited even as later
+            // events hand back perfectly good ids. One truncated response would
+            // disable the update path for that activity for good, adding a CRM
+            // record per event. Upgrade the row as soon as an id is known — safe on
+            // any ledger, because recordSynced() is required to upsert, and limited
+            // to lookup-capable ledgers so plain ones are still written exactly once.
+            $ledgerNeedsCrmId = $ledger instanceof SyncLedgerLookupInterface
+                && $alreadySynced
+                && $knownCrmId === null
+                && $crmId !== null;
+
+            if ($ledger !== null && $id !== '' && ($recreated || !$alreadySynced || $ledgerNeedsCrmId)) {
+                if ($crmId === null || $crmId === '') {
+                    $this->logger->error(
+                        'CRM activity write for {id} returned no record id — ledger cannot name it, so follow-up events cannot update it',
+                        ['id' => $id],
+                    );
+                }
+
+                $ledger->recordSynced('activity', $id, $crmId);
+            }
+
+            $result->addRecord(new RecordResult('activity', $id, $crmId, SyncStatus::Updated));
         } catch (\Throwable $e) {
             $this->logger->error('Webhook sync failed for activity {id}: {error}', [
                 'id' => $id,
@@ -216,22 +260,30 @@ final class WebhookSync
     }
 
     /**
-     * Update the recorded CRM record, falling back to the adapter's upsert when it
-     * no longer exists (deleted CRM-side) so the activity can be re-created
-     * instead of failing on every event from now on.
+     * Update the recorded CRM record, re-creating it only when the CRM states it
+     * is gone (deleted CRM-side), so the activity recovers instead of failing on
+     * every event from now on.
+     *
+     * Only RecordNotFoundException is recoverable. Catching more than that — a
+     * timeout, a 500, a rate-limit — creates a second CRM record for a record
+     * that is still there, and repoints the ledger at the copy: a transient
+     * outage becomes permanent duplication. Everything else propagates, so the
+     * event is reported Failed with the ledger untouched and can be retried.
+     *
+     * @return array{0: Activity, 1: bool} the record, and whether it was re-created
      */
-    private function updateOrRecreate(string $crmId, string $lookupField, Activity $mappedActivity): Activity
+    private function updateOrRecreate(string $crmId, string $lookupField, Activity $mappedActivity): array
     {
         try {
-            return $this->crmAdapter->updateActivity($crmId, $mappedActivity);
-        } catch (\Throwable $e) {
+            return [$this->crmAdapter->updateActivity($crmId, $mappedActivity), false];
+        } catch (RecordNotFoundException $e) {
             $this->logger->warning(
-                'Updating recorded CRM activity {crmId} failed ({error}) — re-creating it',
+                'Recorded CRM activity {crmId} no longer exists ({error}) — re-creating it',
                 ['crmId' => $crmId, 'error' => $e->getMessage()],
             );
-
-            return $this->crmAdapter->upsertActivity($lookupField, $mappedActivity);
         }
+
+        return [$this->crmAdapter->upsertActivity($lookupField, $mappedActivity), true];
     }
 
     private function autoCreateContactFromAccount(
