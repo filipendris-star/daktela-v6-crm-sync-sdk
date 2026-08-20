@@ -284,6 +284,25 @@ final class WebhookSyncTest extends TestCase
         self::assertSame(['crm-2'], $crm->updated, 'the third event updated the recorded record');
     }
 
+    public function testAnEmptyCrmIdIsRecordedAsUnknownRatherThanAsAnId(): void
+    {
+        // '' and null are the same fact: the write named no record. Stored as '' it
+        // passes the "we already know the id" test, so the row is never upgraded and
+        // every later event tries to update the CRM against an empty id — failing
+        // forever instead of recovering as soon as a real id turns up.
+        $ledger = new WebhookLookupLedger();
+        $crm = new FirstWriteEmptyIdCrmAdapter();
+        $webhookSync = $this->webhookSyncFor($crm, $ledger);
+
+        $webhookSync->syncActivity('call-1', ActivityType::Call);
+        self::assertNull($ledger->findCrmId('activity', 'call-1'), 'empty is stored as unknown');
+
+        $second = $webhookSync->syncActivity('call-1', ActivityType::Call);
+
+        self::assertSame(SyncStatus::Updated, $second->getRecords()[0]->status, 'recovers instead of failing');
+        self::assertSame('crm-2', $ledger->findCrmId('activity', 'call-1'), 'and the row is upgraded');
+    }
+
     public function testExportWithoutAnIdIsStillRecordedSoTheBatchPathCannotDuplicate(): void
     {
         // The CRM write succeeded but the adapter named no record. Refusing to
@@ -802,6 +821,18 @@ final class FirstWriteIdlessCrmAdapter extends RecordingActivityCrmAdapter
         $this->created[] = $id;
 
         return count($this->created) === 1 ? Activity::fromArray([]) : Activity::fromArray(['id' => $id]);
+    }
+}
+
+/** Adapter whose first write returns an EMPTY id; later ones name the record. */
+final class FirstWriteEmptyIdCrmAdapter extends RecordingActivityCrmAdapter
+{
+    public function upsertActivity(string $lookupField, Activity $activity): Activity
+    {
+        $id = 'crm-' . (count($this->created) + 1);
+        $this->created[] = $id;
+
+        return Activity::fromArray(['id' => count($this->created) === 1 ? '' : $id]);
     }
 }
 

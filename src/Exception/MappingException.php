@@ -14,6 +14,25 @@ class MappingException extends SyncException
     }
 
     /**
+     * A mapping rule has no field to write to in the direction it is used.
+     *
+     * On cc_to_crm the target is crm_field, which the loader lets a static-value
+     * rule omit (correct for crm_to_cc, where crm_field is the read side). Such a
+     * rule cannot be applied on export, and applying it anyway wrote the value
+     * under the empty key.
+     */
+    public static function missingTargetField(string $ccField, string $direction): self
+    {
+        return new self(sprintf(
+            'Mapping rule for cc_field "%s" has no target field for direction "%s". '
+            . 'A %s rule must name crm_field — it is the field being written.',
+            $ccField,
+            $direction,
+            $direction,
+        ));
+    }
+
+    /**
      * A relation could not be resolved because syncing the referenced entity
      * failed — as opposed to it not existing in the CRM, which is a documented
      * pass-through. Fails the referencing record instead of writing the raw CRM

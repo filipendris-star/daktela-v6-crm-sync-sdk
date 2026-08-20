@@ -163,8 +163,23 @@ final class SyncEngine
 
             // Step 2: Build relation maps from contact mapping configs
             // Only if accounts weren't synced above (syncAccounts builds relation maps directly)
+            //
+            // Contained like every other step. This one scans the CRM's accounts
+            // unfiltered (no `since`), so it is among the likeliest places for a
+            // transient CRM fault — and letting it propagate would abort the whole
+            // run before FullSyncResult exists, so a scheduler checking
+            // hasStepFailures() could not tell it from a crash. Reported and
+            // survived instead: the later steps still run, and a record whose
+            // relation cannot be resolved fails on its own (the on-demand resolver
+            // retries the lookup per record) rather than being written with a raw
+            // CRM foreign key.
             if (!$this->config->isEntityEnabled('account')) {
-                $this->batchSync->buildRelationMaps();
+                try {
+                    $this->batchSync->buildRelationMaps();
+                } catch (\Throwable $e) {
+                    $this->logger->error('Building relation maps failed: {error}', ['error' => $e->getMessage()]);
+                    $this->stepFailures['relation_maps'] = $e->getMessage();
+                }
             }
 
             // Step 3: Sync contacts (uses relation maps to resolve account references)

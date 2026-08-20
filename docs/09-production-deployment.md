@@ -79,17 +79,23 @@ $engine = new SyncEngine(
 
 ### Safety Guarantees
 
-The engine automatically loops through all batches for each entity type. State is **only** saved after all batches complete, and only when:
+The engine loops through all batches for an entity type before saving that
+entity's timestamp, and withholds it entirely when **every** record failed — so
+a total outage re-covers the same window on the next run.
 
-- **Give the scheduled run a timeout.** The SDK trusts an adapter's pagination: a
-  fresh page token means "there is more", however many record-less pages precede
-  it, because a filtered search legitimately scans many. An adapter whose
-  `has_more` never turns false therefore drains forever, and bounding a run's
-  total work belongs to whatever schedules it (`timeout`, a systemd
-  `RuntimeMaxSec`, or equivalent).
-- **Total failure only** — the timestamp is withheld only when *every* record failed, so the next run re-covers the same window. A partial failure still advances it: individually failed records are reported in `SyncResult` but are not re-offered automatically (their source timestamp has not moved), so re-drive them from the result if that matters
+**A partial failure still advances the timestamp.** Individually failed records
+are reported in `SyncResult`, but they are *not* re-offered on the next run:
+their source timestamp has not moved, so they fall outside the incremental
+window. If you need them retried, read the failures off `SyncResult` and
+re-drive them, or run a forced full sync. Do not assume a failed record comes
+back on its own.
 
-This means the engine will never skip records due to a partial sync or per-batch failures.
+**Give the scheduled run a timeout.** The SDK trusts an adapter's pagination: a
+fresh page token means "there is more", however many record-less pages precede
+it, because a filtered search legitimately scans many. An adapter whose
+`has_more` never turns false therefore drains until it is stopped, so bounding a
+run's total work belongs to whatever schedules it (`timeout`, a systemd
+`RuntimeMaxSec`, or equivalent).
 
 ### State File
 

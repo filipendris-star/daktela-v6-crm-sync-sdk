@@ -15,8 +15,16 @@ use Daktela\CrmSync\Sync\CursorPage;
  * null `nextCursor`; neither a short page nor an empty one ends it, since
  * filtered searches (e.g. HubSpot) legitimately return fewer rows than the limit
  * (possibly none at all) while more pages remain. Return `nextCursor: null` on
- * the last page — an endless stream of empty tokened pages is treated as an
- * adapter fault and aborts the drain.
+ * the last page.
+ *
+ * That null is the ONLY thing that ends a drain. A page whose token differs from
+ * the one it was handed is trusted, however many record-less pages precede it,
+ * because "runaway adapter" and "large sparsely-matching set" are
+ * indistinguishable from the sync layer's side. Handing back the very token you
+ * were given is the one detectable fault and aborts the drain. So an adapter
+ * whose has_more never turns false drains until the process is stopped: getting
+ * the terminating null right is the adapter's responsibility, and bounding a
+ * run's total work belongs to whatever schedules it (see docs/09).
  *
  * Applies to the crm_to_cc imports (contacts, accounts) — those are read from the
  * CRM. Activities flow cc_to_crm and are read from the Contact Centre adapter, so

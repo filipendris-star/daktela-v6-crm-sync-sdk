@@ -325,6 +325,27 @@ final class FullSyncTest extends TestCase
         );
     }
 
+    public function testAFailingRelationMapScanDoesNotAbortTheRun(): void
+    {
+        // With the account entity disabled, step 2 builds the relation maps by
+        // scanning the CRM's accounts unfiltered — the likeliest place in the run
+        // for a transient CRM fault, and the one step that used to sit outside the
+        // isolation. Letting it propagate aborted fullSync() before FullSyncResult
+        // existed, so a scheduler checking hasStepFailures() could not tell it from
+        // a crash, and contacts/activities/custom entities never ran.
+        $crm = new FailingAccountsCrmAdapter(
+            contacts: [Contact::fromArray(['id' => 'c1', 'full_name' => 'John', 'email' => 'j@t.com'])],
+        );
+        $cc = new FakeCcAdapter();
+
+        $results = $this->engine($crm, $cc, accountEnabled: false)->fullSync();
+
+        self::assertTrue($results->hasStepFailures(), 'the fault must be reported, not thrown');
+        self::assertArrayHasKey('relation_maps', $results->stepFailures);
+        self::assertSame(1, $results->contact?->getTotalCount(), 'contacts still ran');
+        self::assertCount(1, $cc->contacts, 'and a contact with no relation still synced');
+    }
+
     private function engine(
         FakeCrmAdapter $crm,
         FakeCcAdapter $cc,

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Daktela\CrmSync\Mapping;
 
 use Daktela\CrmSync\Entity\EntityInterface;
+use Daktela\CrmSync\Exception\MappingException;
 use Daktela\CrmSync\Mapping\Transformer\TransformerRegistry;
 use Daktela\CrmSync\Sync\SyncDirection;
 
@@ -44,6 +45,18 @@ final class FieldMapper
             } else {
                 $readField = $mapping->ccField;
                 $writeField = $mapping->crmField;
+            }
+
+            // A rule with nowhere to write cannot be honoured, and guessing is
+            // worse than refusing: writing under the empty key puts a "" entry in
+            // the payload the CRM either stores as junk or rejects with a 400, and
+            // the rule silently fails to override the base rule it was meant to
+            // replace (forType() keys on crm_field, so it never matches). Reached
+            // by a static-value rule that omits crm_field on a cc_to_crm mapping —
+            // legal on import, where crm_field is the read side, but on export it
+            // IS the target.
+            if ($writeField === '') {
+                throw MappingException::missingTargetField($mapping->ccField, $direction->value);
             }
 
             if ($mapping->hasStaticValue) {

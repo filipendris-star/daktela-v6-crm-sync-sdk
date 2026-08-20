@@ -207,6 +207,11 @@ final class WebhookSync
             // it must be reported. Keying this on $alreadySynced instead nulled the
             // targetId of every follow-up event handled through upsert.
             $crmId = $knownCrmId !== null && !$recreated ? $knownCrmId : $synced->getId();
+            // An empty id is the same fact as no id, and must be stored the same
+            // way: recorded as '' it satisfies the "already known" test below, so
+            // the row is never upgraded and every later event tries to update the
+            // CRM against an empty id and fails, permanently.
+            $crmId = $crmId === '' ? null : $crmId;
 
             // Record in the ledger so a later batch run (create-without-lookup when
             // a ledger is set) skips this activity instead of duplicating it. Write
@@ -236,7 +241,7 @@ final class WebhookSync
                 && $crmId !== null;
 
             if ($ledger !== null && $id !== '' && ($recreated || !$alreadySynced || $ledgerNeedsCrmId)) {
-                if ($crmId === null || $crmId === '') {
+                if ($crmId === null) {
                     $this->logger->error(
                         'CRM activity write for {id} returned no record id — ledger cannot name it, so follow-up events cannot update it',
                         ['id' => $id],
