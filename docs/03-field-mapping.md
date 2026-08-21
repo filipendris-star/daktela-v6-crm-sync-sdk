@@ -71,11 +71,16 @@ once the mapping is fixed, the next run exports the records properly.
 nested relations so rules can address them as scalars: `user_email`,
 `user_login`, `user_title`, `contact_name`, and `item_<field>` for every
 scalar field of the type-specific item record (`item_direction`,
-`item_answered`, `item_text`, ...). For call activities it also derives
-**`item_call_state`** from direction + answered — one token
-(`out_answered`, `out_noanswer`, `in_answered`, `in_missed`,
+`item_answered`, `item_text`, ...). For any item carrying **both**
+`item_direction` and `item_answered` it also derives **`item_call_state`** —
+one token (`out_answered`, `out_noanswer`, `in_answered`, `in_missed`,
 `internal_answered`, `internal_noanswer`) that a single `value_map` can turn
 into a CRM `done` flag or subject, which two separate fields cannot express.
+Calls, emails and the chat channels all qualify; the direction is matched
+case-insensitively, since the platform stores it lowercase for calls and
+emails but uppercase for the chat family. An item without `item_answered`
+(so no answered/unanswered distinction exists) gets no `item_call_state` at
+all rather than a guessed one.
 
 **`lookup_field` addresses different sides per direction.** On import
 (`crm_to_cc`) the upsert looks up the *CC-side* record, so `lookup_field`

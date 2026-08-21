@@ -378,6 +378,28 @@ final class BatchSyncCustomExportTest extends TestCase
         self::assertSame(0, $result->getFailedCount());
     }
 
+    public function testARowWithAnEmptyIdIsTreatedAsIdLessRatherThanWrittenBackToNothing(): void
+    {
+        // '' is not an id. Passed through, it clears the "$sourceId !== null"
+        // gate and the write-back runs against an empty id — a CC adapter that
+        // takes that as a no-op then reports the row as departed while it never
+        // leaves the filtered set, so no row consumes offset and the drain never
+        // advances. The spin guard cannot catch it either: it keys on the first
+        // row's id, and an empty one disables the guard.
+        $ccAdapter = $this->ccAdapterYielding([['id' => '', 'title' => 'No id']]);
+        $ccAdapter->expects(self::never())->method('updateContact');
+
+        $result = $this->runExport(
+            $ccAdapter,
+            $this->stubCrmAdapter(),
+            $this->entryWritingBack('name'),
+            since: new \DateTimeImmutable('-1 hour'),
+        );
+
+        self::assertSame(1, $result->getCreatedCount(), 'the record still exports');
+        self::assertTrue($result->isExhausted(), 'and the drain terminates');
+    }
+
     private function stubCrmAdapter(): CrmAdapterInterface&SupportsCustomEntityWriteInterface&MockObject
     {
         $crmAdapter = $this->writableCrmAdapter();

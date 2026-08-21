@@ -789,7 +789,13 @@ final class BatchSync
         MappingCollection $mapping,
         array $row,
     ): array {
-        $sourceId = isset($row['id']) ? (string) $row['id'] : null;
+        // '' is treated as id-less, not as an id: it would otherwise pass the
+        // "$sourceId !== null" gates below and attempt a write-back against an
+        // empty id, so a CC adapter that accepts that as a no-op would report the
+        // row as departed while it never leaves the filtered set — and the spin
+        // guard cannot arm on an empty first id, so the drain would not terminate.
+        $rowId = isset($row['id']) ? (string) $row['id'] : '';
+        $sourceId = $rowId !== '' ? $rowId : null;
         $departed = null;
 
         try {

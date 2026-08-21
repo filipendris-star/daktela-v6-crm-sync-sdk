@@ -76,6 +76,13 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEnt
             $resolved = $this->findUserLoginByEmail($userValue);
             if ($resolved !== null) {
                 $contact->set('user', $resolved);
+                // The write path (prepareContactData) re-triggers on any 'user'
+                // containing '@' — now against the LOGIN we just resolved. Where
+                // logins are email-shaped that is two wasted Users reads per
+                // contact, and on a miss it strips the owner and negative-caches
+                // a perfectly valid login. Cache the login as its own answer so
+                // the second lookup resolves to itself instead of querying.
+                $this->userLoginCache[strtolower($resolved)] = $resolved;
             } else {
                 // Distinguish "no such user" (negative result cached) from a
                 // transient lookup failure (never cached): only a genuine
@@ -216,9 +223,15 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEnt
             // fail loudly: quietly ending the enumeration reports an empty, clean
             // batch, the incremental window advances, and every record in it is
             // silently skipped forever.
-            if ($response->hasErrors()) {
-                throw AdapterException::queryFailed($entityType, $this->formatResponseErrors($response));
-            }
+            //
+            // hasErrors() alone is NOT enough. The connector returns
+            // Response(null, 0, [], status) for any body without a `result` key
+            // (ApiCommunicator::processResponse) — an empty body, a proxy
+            // interstitial, an error envelope carrying no result — so a failed
+            // request arrives here with NO errors and null data, which isEmpty()
+            // then reads as "end of data". Check the status and the envelope too;
+            // a genuine empty page carries `result.data: []`, an array, never null.
+            $this->assertQueryable($response, $entityType);
 
             if ($response->isEmpty()) {
                 return;
@@ -296,7 +309,12 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEnt
             $request->setTake(1);
 
             $response = $this->client->execute($request);
-            if ($response->hasErrors()) {
+            // Same three-part test as the enumerations: a result-less body reports
+            // no errors and null data, and treating that as "no such user" would
+            // negative-cache a transient failure for the whole run — stripping the
+            // owner from every contact behind it, which is what this flag exists
+            // to prevent.
+            if (!$this->isQueryable($response)) {
                 $lookupFailed = true;
                 continue;
             }
@@ -330,6 +348,8 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEnt
      *               per-type record (item_direction, item_answered, ...).
      *               `item` is type-specific (call, sms, email, ...), so the
      *               available item_* fields differ per activity type.
+     *  - item_call_state, derived from item_direction x item_answered for any
+     *    item carrying both (see below).
      *
      * @param array<string, mixed> $row
      * @return array<string, mixed>
@@ -366,8 +386,15 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEnt
         // (direction × answered) is not expressible from the raw fields alone.
         // An unanswered inbound call is a missed call regardless of the
         // `missed_call` flag, so direction + answered fully determine the state.
+        //
+        // Derived for every item type carrying both fields, not just calls:
+        // direction x answered is equally meaningful for a chat or an SMS. The
+        // direction is case-folded because the platform is not consistent about
+        // it — call and email items store 'in'/'out' while the chat family
+        // (web, fbm, wap, viber) stores 'IN'/'OUT', which used to miss both arms
+        // and land every chat in the internal_* default.
         if (isset($row['item_direction']) && array_key_exists('item_answered', $row)) {
-            $direction = (string) $row['item_direction'];
+            $direction = strtolower((string) $row['item_direction']);
             $answered = !empty($row['item_answered']);
             $row['item_call_state'] = match ($direction) {
                 'in' => $answered ? 'in_answered' : 'in_missed',
@@ -409,11 +436,10 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEnt
 
             $response = $this->client->execute($pageRequest);
 
-            // See iterateEntity(): a swallowed API error would let the incremental
-            // window advance over records that were never read.
-            if ($response->hasErrors()) {
-                throw AdapterException::queryFailed('activity', $this->formatResponseErrors($response));
-            }
+            // See iterateEntity(): a swallowed API error — including one that
+            // arrives as a result-less body with no errors at all — would let the
+            // incremental window advance over records that were never read.
+            $this->assertQueryable($response, 'activity');
 
             if ($response->isEmpty()) {
                 return;
@@ -656,6 +682,38 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEnt
         } catch (RequestException $e) {
             throw AdapterException::updateFailed($model, $id, $e, $e->getMessage());
         }
+    }
+
+    /**
+     * Did this read actually return a result set?
+     *
+     * Three ways it can fail, and only the first is what most code checks:
+     * an error envelope (hasErrors), a non-2xx status, and — the quiet one — a
+     * body with no `result` key at all, which the connector turns into
+     * Response(null, 0, [], status). That last shape has an empty error array,
+     * so hasErrors() is false and isEmpty() is true: indistinguishable from a
+     * legitimate empty page unless the null data is checked, because a real
+     * empty page carries `result.data: []` (an array).
+     */
+    private function isQueryable(\Daktela\DaktelaV6\Response\Response $response): bool
+    {
+        return $response->isSuccess()
+            && !$response->hasErrors()
+            && $response->getData() !== null;
+    }
+
+    /** {@see isQueryable()}; throws instead of reporting, for the enumerations. */
+    private function assertQueryable(\Daktela\DaktelaV6\Response\Response $response, string $entityType): void
+    {
+        if ($this->isQueryable($response)) {
+            return;
+        }
+
+        $detail = $response->hasErrors()
+            ? $this->formatResponseErrors($response)
+            : sprintf('HTTP %d with no result envelope', $response->getHttpStatus());
+
+        throw AdapterException::queryFailed($entityType, $detail);
     }
 
     private function formatResponseErrors(\Daktela\DaktelaV6\Response\Response $response): string

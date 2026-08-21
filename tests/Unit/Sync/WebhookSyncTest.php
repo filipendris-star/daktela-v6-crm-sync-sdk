@@ -303,6 +303,27 @@ final class WebhookSyncTest extends TestCase
         self::assertSame('crm-2', $ledger->findCrmId('activity', 'call-1'), 'and the row is upgraded');
     }
 
+    public function testANotNullLedgerColumnCoercingNullToEmptyStillRecovers(): void
+    {
+        // The null row is normalised on the way OUT, but a store cannot always
+        // keep it: a `crm_id VARCHAR NOT NULL DEFAULT ''` column returns '' where
+        // null went in. Read back unnormalised, '' is !== null, so the update path
+        // runs against an empty id and fails on every event while the repair
+        // clause — gated on $knownCrmId === null — never arms.
+        $ledger = new WebhookNotNullColumnLedger();
+        $crm = new FirstWriteIdlessCrmAdapter();
+        $webhookSync = $this->webhookSyncFor($crm, $ledger);
+
+        $webhookSync->syncActivity('call-1', ActivityType::Call);
+        self::assertSame('', $ledger->findCrmId('activity', 'call-1'), 'the store coerced the null row to empty');
+
+        $second = $webhookSync->syncActivity('call-1', ActivityType::Call);
+
+        self::assertSame(SyncStatus::Updated, $second->getRecords()[0]->status);
+        self::assertSame('crm-2', $second->getRecords()[0]->targetId, 'the row is repaired rather than wedged');
+        self::assertSame([], $crm->updated, 'nothing was updated against an empty id');
+    }
+
     public function testExportWithoutAnIdIsStillRecordedSoTheBatchPathCannotDuplicate(): void
     {
         // The CRM write succeeded but the adapter named no record. Refusing to
@@ -819,6 +840,23 @@ class WebhookPlainLedger implements \Daktela\CrmSync\State\SyncLedgerInterface
 /** Ledger that can hand the recorded CRM id back. */
 final class WebhookLookupLedger extends WebhookPlainLedger implements \Daktela\CrmSync\State\SyncLedgerLookupInterface
 {
+    public function findCrmId(string $entityType, string $ccId): ?string
+    {
+        return $this->rows[$entityType . '|' . $ccId] ?? null;
+    }
+}
+
+/**
+ * A ledger backed by a NOT NULL column: the null row goes in and '' comes back.
+ * This is what a plain SQL store does unless it declares crm_id nullable.
+ */
+final class WebhookNotNullColumnLedger extends WebhookPlainLedger implements \Daktela\CrmSync\State\SyncLedgerLookupInterface
+{
+    public function recordSynced(string $entityType, string $ccId, ?string $crmId): void
+    {
+        parent::recordSynced($entityType, $ccId, $crmId ?? '');
+    }
+
     public function findCrmId(string $entityType, string $ccId): ?string
     {
         return $this->rows[$entityType . '|' . $ccId] ?? null;

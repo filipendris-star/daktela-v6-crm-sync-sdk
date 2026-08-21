@@ -143,8 +143,13 @@ final class WebhookSync
         try {
             $ledger = $this->ledger;
             $alreadySynced = $ledger !== null && $id !== '' && $ledger->hasSynced('activity', $id);
+            // Normalised on the way IN as well as on the way out (see below): a
+            // ledger backed by a NOT NULL column stores the null row as '' and
+            // hands '' back here. Left as-is it is !== null, so the update path
+            // runs against an empty id and fails on every event, while the repair
+            // clause that would have replaced the row never arms.
             $knownCrmId = $alreadySynced && $ledger instanceof SyncLedgerLookupInterface
-                ? $ledger->findCrmId('activity', $id)
+                ? ($ledger->findCrmId('activity', $id) ?: null)
                 : null;
 
             $activity = $this->ccAdapter->findActivity($id, $type);
