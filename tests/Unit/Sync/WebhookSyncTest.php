@@ -539,6 +539,48 @@ final class WebhookSyncTest extends TestCase
         self::assertSame(0, $payload['done'], 'missed inbound call must map to done = 0');
     }
 
+    public function testWebhookRefusesToWriteAnEmptyPayloadForAnUnmappedType(): void
+    {
+        // The webhook path maps through the same forType() rules as the batch
+        // path, so a types-only mapping blanks the same records here. It must
+        // refuse for the same reason: the ledger makes a webhook-written payload
+        // permanent, and a later batch run skips it.
+        $activity = Activity::fromArray(['id' => 'sms-1', 'activity_type' => 'sms', 'name' => 'sms-1', 'title' => 'Text']);
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('findActivity')->willReturn($activity);
+
+        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
+        $crmAdapter->expects(self::never())->method('upsertActivity');
+        $crmAdapter->expects(self::never())->method('createActivity');
+
+        $config = new SyncConfiguration(
+            instanceUrl: 'https://test.daktela.com',
+            accessToken: 'test-token',
+            database: 'test-db',
+            batchSize: 100,
+            entities: [
+                'activity' => new EntitySyncConfig(true, SyncDirection::CcToCrm, 'activities.yaml', [ActivityType::Sms]),
+            ],
+            mappings: ['activity' => new MappingCollection('activity', 'name', [], [
+                'call' => [new FieldMapping('title', 'subject')],
+            ])],
+        );
+
+        $webhookSync = new WebhookSync(
+            $ccAdapter,
+            $crmAdapter,
+            new FieldMapper(TransformerRegistry::withDefaults()),
+            $config,
+            new NullLogger(),
+        );
+
+        $result = $webhookSync->syncActivity('sms-1', ActivityType::Sms);
+
+        self::assertSame(1, $result->getFailedCount());
+        self::assertStringContainsString('empty payload', (string) $result->getFailedRecords()[0]->errorMessage);
+    }
+
     private function createConfigWithActivityTypeRules(): SyncConfiguration
     {
         $activityMapping = new MappingCollection(

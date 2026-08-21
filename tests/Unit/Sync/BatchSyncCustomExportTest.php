@@ -7,6 +7,7 @@ namespace Daktela\CrmSync\Tests\Unit\Sync;
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\SupportsCustomEntityWriteInterface;
+use Daktela\CrmSync\Adapter\SupportsEntityIterationInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Entity\Account;
 use Daktela\CrmSync\Entity\Activity;
@@ -92,7 +93,10 @@ final class BatchSyncCustomExportTest extends TestCase
 
     public function testFirstRunSeedsCursorAndExportsNothing(): void
     {
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->expects(self::never())->method('iterateEntity');
 
         $crmAdapter = $this->writableCrmAdapter();
@@ -114,7 +118,10 @@ final class BatchSyncCustomExportTest extends TestCase
     {
         $entry = $this->entry();
 
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->expects(self::once())
             ->method('iterateEntity')
             ->with(
@@ -136,7 +143,10 @@ final class BatchSyncCustomExportTest extends TestCase
         // Returning a clean empty result would let saveState() advance this
         // entity's watermark on every run, so once the adapter gains the
         // capability everything edited in the meantime is outside the window.
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->expects(self::never())->method('iterateEntity');
 
         $crmAdapter = $this->createMock(CrmAdapterInterface::class); // no write interface
@@ -144,6 +154,20 @@ final class BatchSyncCustomExportTest extends TestCase
         $this->expectException(\Daktela\CrmSync\Exception\NotSupportedException::class);
 
         $this->runExport($ccAdapter, $crmAdapter, $this->entry(), since: new \DateTimeImmutable('-1 hour'));
+    }
+
+    public function testCcAdapterWithoutEntityIterationAbortsInsteadOfSkipping(): void
+    {
+        // Reading the export set is an opt-in capability, so a host's own CC
+        // adapter — written before it existed — must still load and run every
+        // other direction. Only this step fails, and it fails loudly: a clean
+        // empty result would advance the watermark past records it never read.
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class); // no iteration interface
+
+        $this->expectException(\Daktela\CrmSync\Exception\NotSupportedException::class);
+        $this->expectExceptionMessageMatches('/SupportsEntityIterationInterface/');
+
+        $this->runExport($ccAdapter, $this->writableCrmAdapter(), $this->entry(), since: new \DateTimeImmutable('-1 hour'));
     }
 
     public function testFailedCrmCreateIsRecordedPerRecord(): void
@@ -382,9 +406,12 @@ final class BatchSyncCustomExportTest extends TestCase
         );
     }
 
-    private function ccAdapterYielding(array $rows): ContactCentreAdapterInterface&MockObject
+    private function ccAdapterYielding(array $rows): ContactCentreAdapterInterface&SupportsEntityIterationInterface&MockObject
     {
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->method('iterateEntity')->willReturn($this->gen($rows));
 
         return $ccAdapter;
@@ -455,7 +482,10 @@ final class BatchSyncCustomExportTest extends TestCase
             ['id' => 'c3', 'title' => 'C'],
         ];
 
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->method('iterateEntity')->willReturnCallback(
             function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
                 yield from array_slice($rows, $offset);
@@ -506,7 +536,10 @@ final class BatchSyncCustomExportTest extends TestCase
             ['id' => 'c3', 'title' => 'C'],
         ];
 
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->method('iterateEntity')->willReturnCallback(
             function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
                 yield from array_slice($rows, $offset);
@@ -542,7 +575,10 @@ final class BatchSyncCustomExportTest extends TestCase
             $rows[] = ['id' => 'c' . ($i + 1), 'title' => $t];
         }
 
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->method('iterateEntity')->willReturnCallback(
             function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
                 yield from array_slice($rows, $offset);
@@ -633,19 +669,22 @@ final class BatchSyncCustomExportTest extends TestCase
             $rows[] = ['id' => 'c' . $i, 'title' => 'T' . $i];
         }
 
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->method('iterateEntity')->willReturnCallback(
             function (string $source, ?\DateTimeImmutable $since, int $offset) use (&$rows): \Generator {
                 // Page-faithful fake: pages of 100, each re-sliced against the
                 // live set — exactly the real adapter's skip += pageSize walk.
                 $cursor = $offset;
                 while (true) {
-                    $page = array_slice($rows, $cursor, ContactCentreAdapterInterface::ITERATE_PAGE_SIZE);
+                    $page = array_slice($rows, $cursor, SupportsEntityIterationInterface::ITERATE_PAGE_SIZE);
                     if ($page === []) {
                         return;
                     }
                     yield from $page;
-                    $cursor += ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
+                    $cursor += SupportsEntityIterationInterface::ITERATE_PAGE_SIZE;
                 }
             },
         );
@@ -717,7 +756,7 @@ final class BatchSyncCustomExportTest extends TestCase
  * honours the entry's export_filter against the current contents. Without that
  * fidelity a fixture can assert a state the CC side could never be in.
  */
-final class ExportFilterAwareCcAdapter implements ContactCentreAdapterInterface
+final class ExportFilterAwareCcAdapter implements ContactCentreAdapterInterface, SupportsEntityIterationInterface
 {
     /** @var array<string, array<string, mixed>> */
     private array $store = [];

@@ -33,6 +33,29 @@ class MappingException extends SyncException
     }
 
     /**
+     * An activity type resolved to an empty rule set, so mapping it produced an
+     * empty payload. Reached by a mapping file that declares only `types:` (no
+     * `default:` block, which the loader tolerates) while `activity_types`
+     * includes a type absent from that map: the base rule set is empty and
+     * forType() has nothing to merge over it.
+     *
+     * Writing the empty payload creates a blank record in the CRM, which a set
+     * ledger then records as exported — permanently, and never revisited. Failing
+     * the record instead leaves the ledger untouched, so fixing the mapping and
+     * re-running exports it properly.
+     */
+    public static function emptyRuleSet(string $entityType, ?string $activityType = null): self
+    {
+        return new self(sprintf(
+            'Mapping for %s%s produced an empty payload — no field rules apply to it. '
+            . 'Add a "default:" block, or a "types:" entry for this type; '
+            . 'refusing to create a blank CRM record.',
+            $entityType,
+            $activityType !== null ? sprintf(' type "%s"', $activityType) : '',
+        ));
+    }
+
+    /**
      * A relation could not be resolved because syncing the referenced entity
      * failed — as opposed to it not existing in the CRM, which is a documented
      * pass-through. Fails the referencing record instead of writing the raw CRM

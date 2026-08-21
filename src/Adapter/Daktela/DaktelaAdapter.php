@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Daktela\CrmSync\Adapter\Daktela;
 
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
+use Daktela\CrmSync\Adapter\SupportsEntityIterationInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Entity\Account;
 use Daktela\CrmSync\Entity\Activity;
@@ -16,7 +17,7 @@ use Daktela\DaktelaV6\Exception\RequestException;
 use Daktela\DaktelaV6\RequestFactory;
 use Psr\Log\LoggerInterface;
 
-final class DaktelaAdapter implements ContactCentreAdapterInterface
+final class DaktelaAdapter implements ContactCentreAdapterInterface, SupportsEntityIterationInterface
 {
     private const ACTIVITIES_MODEL = 'Activities';
 
@@ -201,7 +202,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         // records are edited mid-drain) would corrupt the pagination.
         $request->addSort('name', 'asc');
 
-        $pageSize = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
+        $pageSize = SupportsEntityIterationInterface::ITERATE_PAGE_SIZE;
         $currentOffset = $offset;
 
         while (true) {
@@ -216,7 +217,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
             // batch, the incremental window advances, and every record in it is
             // silently skipped forever.
             if ($response->hasErrors()) {
-                throw AdapterException::queryFailed($entityType, json_encode($response->getErrors()) ?: 'unknown error');
+                throw AdapterException::queryFailed($entityType, $this->formatResponseErrors($response));
             }
 
             if ($response->isEmpty()) {
@@ -398,7 +399,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
         // the sync layer) needs deterministic row positions.
         $request->addSort('name', 'asc');
 
-        $pageSize = ContactCentreAdapterInterface::ITERATE_PAGE_SIZE;
+        $pageSize = SupportsEntityIterationInterface::ITERATE_PAGE_SIZE;
         $currentOffset = $offset;
 
         while (true) {
@@ -411,7 +412,7 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
             // See iterateEntity(): a swallowed API error would let the incremental
             // window advance over records that were never read.
             if ($response->hasErrors()) {
-                throw AdapterException::queryFailed('activity', json_encode($response->getErrors()) ?: 'unknown error');
+                throw AdapterException::queryFailed('activity', $this->formatResponseErrors($response));
             }
 
             if ($response->isEmpty()) {

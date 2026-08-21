@@ -15,6 +15,7 @@ use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Entity\Contact;
 use Daktela\CrmSync\Entity\EntityInterface;
+use Daktela\CrmSync\Exception\MappingException;
 use Daktela\CrmSync\Exception\RecordNotFoundException;
 use Daktela\CrmSync\Mapping\FieldMapper;
 use Daktela\CrmSync\Mapping\MappingCollection;
@@ -161,6 +162,10 @@ final class WebhookSync
             $typeMapping = $mapping->forType($type->value);
 
             $mapped = $this->fieldMapper->map($activity, $typeMapping, SyncDirection::CcToCrm);
+            if ($mapped === []) {
+                throw MappingException::emptyRuleSet('activity', $type->value);
+            }
+
             $mappedActivity = Activity::fromArray($mapped);
 
             if ($activity->getActivityType() !== null) {

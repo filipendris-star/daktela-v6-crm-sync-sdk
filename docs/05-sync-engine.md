@@ -206,6 +206,12 @@ $engine = new SyncEngine(
 
 State is saved after all batches for an entity type have been processed, unless *every* record failed — that is the only case in which the timestamp is withheld and the next run re-covers the same window. A **partial** failure still advances the timestamp, so individually failed records fall outside the next incremental window until their source timestamp changes again or a forced full sync runs; watch `SyncResult` for them if you need to re-drive them. See the [Production Deployment](09-production-deployment.md) guide for details on safety guarantees.
 
+### Implementing your own state store
+
+`SyncStateStoreInterface` is four methods — two watermark accessors, `clear()`, `clearAll()` — and stays that way: new needs land in opt-in capability interfaces next to it, never as new required methods, so a DB- or Redis-backed store you wrote against an older SDK keeps loading.
+
+**`SupportsCursorStateInterface`** (optional) adds `getCursor()` / `setCursor()`. Implement it alongside `SyncStateStoreInterface` if your CRM adapter also implements [`SupportsCursorPaginationInterface`](04-implementing-crm-adapter.md#supportscursorpaginationinterface): it lets an interrupted cursor drain resume on the next run instead of restarting. Without it the engine logs one warning and falls back to its in-memory cursor, which still walks a drain to the end within a single run — records are re-read, never skipped. `FileSyncStateStore` implements both.
+
 ## Auto-Create Contact from Account
 
 In Daktela, activities can only relate to contacts (not accounts). If an account has contact info (phone, email) and someone calls from that number, the activity won't be paired because there's no contact entity with that info.

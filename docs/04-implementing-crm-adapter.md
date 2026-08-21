@@ -246,7 +246,10 @@ Pipedrive v2 `cursor`, K2 `NextPageURL`) instead of a numeric offset.
 Implement `fetchContactsPage()` / `fetchAccountsPage()` returning a
 `CursorPage(records, nextCursor)`. The engine persists `nextCursor` in the
 sync state between runs, so an interrupted drain resumes instead of
-restarting. Return `nextCursor: null` on the last page — that, and only that,
+restarting — provided the state store implements
+[`SupportsCursorStateInterface`](05-sync-engine.md#implementing-your-own-state-store);
+if it doesn't, the drain still completes within a run, it just starts over
+next run. Return `nextCursor: null` on the last page — that, and only that,
 ends the drain: neither a short page nor an empty one does, because filtered
 searches legitimately return fewer rows than the limit (possibly none at all)
 while more pages remain. Never return the token you were given — a page that

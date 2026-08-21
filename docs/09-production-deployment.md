@@ -335,7 +335,7 @@ Use cases: initial data load, data corruption recovery, after mapping changes.
 
 ### Reset State
 
-Clear saved timestamps so the next sync run processes all records:
+Clear saved timestamps so the next sync run starts without an incremental window:
 
 ```php
 // Reset all entity types
@@ -344,6 +344,28 @@ $engine->resetState();
 // Reset a single entity type
 $engine->resetState('contact');
 ```
+
+**A reset alone does not re-push history for exports.** Clearing a watermark
+makes the next run look like a *first* run, and a first run of a `cc_to_crm`
+entity with `initial_sync: now` (the default — activities, and custom-entity
+exports) seeds the watermark back to now and pushes nothing. That run reports
+`0 total, 0 failed` and looks clean while the history stays permanently outside
+the window. `resetState()` logs a warning naming the affected entities, and so
+does the run that re-seeds.
+
+Imports (`crm_to_cc`: contacts, accounts) have no seed rail, so a reset does
+exactly what it says for them.
+
+To actually re-drive history, use a forced run — it ignores both the watermark
+and the seed rail, so no reset is needed at all:
+
+```php
+$engine->fullSync(forceFullSync: true);
+```
+
+Or set `initial_sync: everything` on the entity, which makes a first run push
+full history. `forceFullSync` is the better tool for a one-off recovery: it is a
+per-run decision rather than a config change someone has to remember to revert.
 
 ### Monitoring
 

@@ -226,6 +226,34 @@ final class BatchSyncCursorPaginationTest extends TestCase
     }
 
 
+    public function testAStateStoreWithoutCursorSupportStillCompletesTheDrainInOneRun(): void
+    {
+        // Cursor persistence is an opt-in capability, NOT part of
+        // SyncStateStoreInterface: a host's own store (DB, Redis) predates it and
+        // must keep working. Such a store degrades to "no cross-run resume" — the
+        // in-run cursor still walks every page to the end.
+        $store = new WatermarkOnlyStateStore();
+
+        $adapter = new FakeCursorCrmAdapter([
+            null => new CursorPage([$this->contact('c1'), $this->contact('c2')], 'CURSOR_P2'),
+            'CURSOR_P2' => new CursorPage([$this->contact('c3')], null),
+        ]);
+
+        $batch = $this->batchSync($adapter, $store, batchSize: 2);
+
+        self::assertFalse($batch->syncContacts()->isExhausted());
+        self::assertTrue($batch->syncContacts()->isExhausted(), 'the drain completes without a persisted cursor');
+        self::assertSame([null, 'CURSOR_P2'], $adapter->cursorsSeen, 'the in-run cursor advanced the drain');
+
+        // And the documented limitation: a NEW run cannot resume mid-drain, so it
+        // restarts from the watermark. Records are re-read, never skipped.
+        $resumed = new FakeCursorCrmAdapter([
+            null => new CursorPage([$this->contact('c1')], null),
+        ]);
+        $this->batchSync($resumed, $store, batchSize: 2)->syncContacts();
+        self::assertSame([null], $resumed->cursorsSeen, 'a fresh run starts over rather than resuming');
+    }
+
     private function batchSync(CrmAdapterInterface $crm, \Daktela\CrmSync\State\SyncStateStoreInterface $store, int $batchSize): BatchSync
     {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
@@ -248,5 +276,36 @@ final class BatchSyncCursorPaginationTest extends TestCase
     private function contact(string $name): Contact
     {
         return new Contact($name, ['name' => $name, 'title' => $name]);
+    }
+}
+
+/**
+ * A state store as it existed before cursor persistence was added: the four
+ * watermark methods and nothing else. Stands in for a host's DB- or Redis-backed
+ * store, which is exactly what a new required interface method would break.
+ */
+final class WatermarkOnlyStateStore implements \Daktela\CrmSync\State\SyncStateStoreInterface
+{
+    /** @var array<string, \DateTimeImmutable> */
+    private array $times = [];
+
+    public function getLastSyncTime(string $entityType): ?\DateTimeImmutable
+    {
+        return $this->times[$entityType] ?? null;
+    }
+
+    public function setLastSyncTime(string $entityType, \DateTimeImmutable $time): void
+    {
+        $this->times[$entityType] = $time;
+    }
+
+    public function clear(string $entityType): void
+    {
+        unset($this->times[$entityType]);
+    }
+
+    public function clearAll(): void
+    {
+        $this->times = [];
     }
 }

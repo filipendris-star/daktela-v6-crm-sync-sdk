@@ -71,7 +71,7 @@ final class FieldMapper
             // keys, and the old is_string() guard silently skipped resolution for
             // them, writing the raw CRM id instead of the resolved Daktela name.
             if ($mapping->relation !== null && (is_string($value) || is_int($value)) && $value !== '') {
-                $value = $this->resolveRelation((string) $value, $mapping->relation, $relationMaps);
+                $value = $this->resolveRelation($value, $mapping->relation, $relationMaps);
             }
 
             if ($mapping->append) {
@@ -178,15 +178,23 @@ final class FieldMapper
     }
 
     /**
+     * Translate a CRM foreign key into its Daktela counterpart, passing the value
+     * through unchanged when the map has no entry for it (a documented
+     * pass-through: the referenced record simply is not synced).
+     *
+     * The ORIGINAL value is returned on a miss, not a stringified copy of it.
+     * Numeric-id CRMs hand back integer keys, and turning an unresolved 4712 into
+     * "4712" is rejected by strictly-typed number fields on the way back out.
+     *
      * @param array<string, array<string, string>> $relationMaps
      */
     private function resolveRelation(
-        string $value,
+        string|int $value,
         RelationConfig $relation,
         array $relationMaps,
-    ): string {
+    ): string|int {
         $map = $relationMaps[$relation->entity] ?? [];
 
-        return $map[$value] ?? $value;
+        return $map[(string) $value] ?? $value;
     }
 }

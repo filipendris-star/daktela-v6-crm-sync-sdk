@@ -6,7 +6,7 @@ namespace Daktela\CrmSync\State;
 
 use Daktela\CrmSync\Exception\StateStoreException;
 
-final class FileSyncStateStore implements SyncStateStoreInterface
+final class FileSyncStateStore implements SyncStateStoreInterface, SupportsCursorStateInterface
 {
     public function __construct(
         private readonly string $filePath,

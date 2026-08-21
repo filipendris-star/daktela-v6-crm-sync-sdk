@@ -42,6 +42,16 @@ class MySyncTest extends TestCase
         self::assertSame(2, $result->getTotalCount());
     }
 
+    // Capability interfaces are feature-detected with instanceof, so a plain
+    // mock of the base interface does NOT satisfy them. Mock the intersection
+    // when the code under test needs one — a cc_to_crm custom entity export,
+    // for instance, reads its set through SupportsEntityIterationInterface:
+    //
+    //   $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+    //       ContactCentreAdapterInterface::class,
+    //       SupportsEntityIterationInterface::class,
+    //   ]);
+
     private function generateContacts(): \Generator
     {
         yield Contact::fromArray(['id' => 'crm-1', 'full_name' => 'John', 'email' => 'john@test.com']);

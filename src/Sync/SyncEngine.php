@@ -289,6 +289,51 @@ final class SyncEngine
         } else {
             $this->stateStore->clearAll();
         }
+
+        $this->warnAboutReseedingExports($entityType);
+    }
+
+    /**
+     * Clearing a watermark makes the next run look like a first run, and a first
+     * run of an EXPORT with `initial_sync: now` seeds the watermark to now and
+     * pushes nothing. So a reset does not, on its own, re-push history for those
+     * entities — the operator has to run with forceFullSync (which ignores both
+     * the watermark and the seed rail) or set `initial_sync: everything`.
+     *
+     * This cannot be decided for the operator: a cleared watermark is
+     * indistinguishable from a never-synced one without inventing extra state, so
+     * the SDK says what will happen instead of guessing which was meant.
+     */
+    private function warnAboutReseedingExports(?string $entityType): void
+    {
+        $affected = [];
+
+        if (($entityType === null || $entityType === 'activity')
+            && $this->config->isEntityEnabled('activity')
+            && $this->config->getEntityConfig('activity')?->initialSync === 'now'
+        ) {
+            $affected[] = 'activity';
+        }
+
+        foreach ($this->config->getEnabledCustomEntities() as $entry) {
+            $key = "custom:{$entry->name}";
+            if (($entityType === null || $entityType === $key)
+                && $entry->direction === SyncDirection::CcToCrm
+                && $entry->initialSync === 'now'
+            ) {
+                $affected[] = $key;
+            }
+        }
+
+        if ($affected === []) {
+            return;
+        }
+
+        $this->logger->warning(
+            'State reset, but {entities} export with initial_sync: now — the next ordinary run will re-seed '
+            . 'the watermark to now and push nothing. Run with forceFullSync to actually re-push history.',
+            ['entities' => implode(', ', $affected)],
+        );
     }
 
     /**

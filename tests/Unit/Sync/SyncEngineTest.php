@@ -527,6 +527,53 @@ final class SyncEngineTest extends TestCase
         $this->addToAssertionCount(1);
     }
 
+    public function testResetStateWarnsThatExportsWillReSeedRatherThanRePushHistory(): void
+    {
+        // Clearing the watermark makes the next run look like a first run, and a
+        // first run of an export with initial_sync: now seeds to now and pushes
+        // nothing. Reset alone therefore does NOT re-push history — which the
+        // operator has to be told, because the run afterwards reports "0 total,
+        // 0 failed" and looks like a success.
+        $logger = new CapturingLogger();
+        $stateStore = $this->createMock(SyncStateStoreInterface::class);
+
+        $engine = new SyncEngine(
+            $this->createMock(ContactCentreAdapterInterface::class),
+            $this->createMock(CrmAdapterInterface::class),
+            $this->createConfig(),
+            $logger,
+            null,
+            $stateStore,
+        );
+
+        $engine->resetState();
+
+        $warnings = $logger->messagesAt('warning');
+        self::assertCount(1, $warnings);
+        self::assertStringContainsString('activity', $warnings[0]);
+        self::assertStringContainsString('forceFullSync', $warnings[0], 'the warning must name the working recovery');
+    }
+
+    public function testResetStateOfAnImportEntityDoesNotWarn(): void
+    {
+        // Imports read from the CRM with no seed rail, so a reset does exactly
+        // what it says for them. Warning anyway would train operators to ignore it.
+        $logger = new CapturingLogger();
+
+        $engine = new SyncEngine(
+            $this->createMock(ContactCentreAdapterInterface::class),
+            $this->createMock(CrmAdapterInterface::class),
+            $this->createConfig(),
+            $logger,
+            null,
+            $this->createMock(SyncStateStoreInterface::class),
+        );
+
+        $engine->resetState('contact');
+
+        self::assertSame([], $logger->messagesAt('warning'));
+    }
+
     private function createConfig(): SyncConfiguration
     {
         $contactMapping = new MappingCollection('contact', 'email', [
@@ -639,5 +686,33 @@ final class SyncEngineTest extends TestCase
     private function arrayToGenerator(array $items): \Generator
     {
         yield from $items;
+    }
+}
+
+/** Minimal PSR-3 logger that keeps interpolated messages per level. */
+final class CapturingLogger extends \Psr\Log\AbstractLogger
+{
+    /** @var array<string, list<string>> */
+    private array $records = [];
+
+    /**
+     * @param mixed $level
+     * @param array<string, mixed> $context
+     */
+    public function log($level, \Stringable|string $message, array $context = []): void
+    {
+        $text = (string) $message;
+        foreach ($context as $key => $value) {
+            if (is_scalar($value) || $value instanceof \Stringable) {
+                $text = str_replace('{' . $key . '}', (string) $value, $text);
+            }
+        }
+        $this->records[(string) $level][] = $text;
+    }
+
+    /** @return list<string> */
+    public function messagesAt(string $level): array
+    {
+        return $this->records[$level] ?? [];
     }
 }

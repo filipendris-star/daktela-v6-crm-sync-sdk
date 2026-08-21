@@ -139,12 +139,46 @@ final class BatchSyncLedgerTest extends TestCase
         return $activity;
     }
 
+    public function testATypeWithNoApplicableRulesFailsInsteadOfCreatingABlankRecord(): void
+    {
+        // A mapping file that declares only `types:` (the loader tolerates an
+        // absent `default:`) leaves the base rule set empty, so an activity type
+        // missing from that map maps to []. Writing that payload creates a blank
+        // CRM record, which the ledger then records as exported — permanently,
+        // and never revisited.
+        $ledger = new InMemoryLedger();
+
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('iterateActivities')->willReturn($this->gen([
+            $this->activityOfType('sms-1', ActivityType::Sms),
+        ]));
+
+        $crmAdapter = $this->createMock(CrmAdapterInterface::class);
+        $crmAdapter->expects(self::never())->method('createActivity');
+        $crmAdapter->expects(self::never())->method('upsertActivity');
+
+        $typesOnly = new MappingCollection('activity', 'name', [], [
+            'call' => [new FieldMapping('title', 'subject')],
+        ]);
+
+        $result = $this->batchSync($ccAdapter, $crmAdapter, $ledger, $typesOnly)
+            ->syncActivities([ActivityType::Sms]);
+
+        self::assertSame(1, $result->getFailedCount());
+        self::assertStringContainsString('empty payload', (string) $result->getFailedRecords()[0]->errorMessage);
+        self::assertFalse(
+            $ledger->hasSynced('activity', 'sms-1'),
+            'nothing was exported, so the ledger must stay clean and the record retryable',
+        );
+    }
+
     private function batchSync(
         ContactCentreAdapterInterface $ccAdapter,
         CrmAdapterInterface $crmAdapter,
         ?SyncLedgerInterface $ledger,
+        ?MappingCollection $mappingOverride = null,
     ): BatchSync {
-        $activityMapping = new MappingCollection('activity', 'name', [
+        $activityMapping = $mappingOverride ?? new MappingCollection('activity', 'name', [
             new FieldMapping('name', 'external_id'),
             new FieldMapping('title', 'subject'),
         ]);
@@ -257,7 +291,10 @@ final class BatchSyncLedgerTest extends TestCase
             $rows[] = ['id' => 'c' . $i, 'title' => 'T' . $i];
         }
 
-        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter = $this->createMockForIntersectionOfInterfaces([
+            ContactCentreAdapterInterface::class,
+            \Daktela\CrmSync\Adapter\SupportsEntityIterationInterface::class,
+        ]);
         $ccAdapter->method('iterateEntity')->willReturnCallback(
             function (string $source, ?\DateTimeImmutable $since, int $offset) use ($rows): \Generator {
                 yield from array_slice($rows, $offset);

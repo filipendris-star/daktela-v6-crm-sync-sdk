@@ -9,6 +9,7 @@ use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\SupportsCursorPaginationInterface;
 use Daktela\CrmSync\Adapter\SupportsCustomEntityWriteInterface;
 use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
+use Daktela\CrmSync\Adapter\SupportsEntityIterationInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
@@ -25,6 +26,7 @@ use Daktela\CrmSync\Mapping\FieldMapper;
 use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\NestedValue;
 use Daktela\CrmSync\Mapping\RelationConfig;
+use Daktela\CrmSync\State\SupportsCursorStateInterface;
 use Daktela\CrmSync\State\SyncLedgerInterface;
 use Daktela\CrmSync\State\SyncStateStoreInterface;
 use Daktela\CrmSync\Sync\Result\AccountSyncResult;
@@ -51,6 +53,9 @@ final class BatchSync
     private array $exportSpinGuard = [];
 
     private bool $forceFullSync = false;
+
+    /** Set once the "state store cannot persist cursors" warning has been emitted */
+    private bool $cursorStateWarned = false;
 
     private ?SyncLedgerInterface $ledger = null;
 
@@ -98,7 +103,38 @@ final class BatchSync
             return null;
         }
 
-        return $this->stateStore?->getCursor($key);
+        $store = $this->cursorStore();
+
+        return $store?->getCursor($key);
+    }
+
+    /**
+     * The state store, but only when it can actually persist cursors. A store
+     * that cannot is not an error — the in-run cursor still completes a drain
+     * within one run — but an interrupted drain restarts next run instead of
+     * resuming, which is worth saying out loud once per instance.
+     */
+    private function cursorStore(): ?SupportsCursorStateInterface
+    {
+        if ($this->stateStore === null) {
+            return null;
+        }
+
+        if ($this->stateStore instanceof SupportsCursorStateInterface) {
+            return $this->stateStore;
+        }
+
+        if (!$this->cursorStateWarned) {
+            $this->cursorStateWarned = true;
+            $this->logger->warning(
+                'State store {store} does not implement SupportsCursorStateInterface — cursor-paginated '
+                . 'drains complete within a run but cannot resume across runs; an interrupted drain restarts '
+                . 'from the watermark (records are re-read, never skipped)',
+                ['store' => $this->stateStore::class],
+            );
+        }
+
+        return null;
     }
 
     /**
@@ -146,7 +182,7 @@ final class BatchSync
         // bound to that query — persisting one would make an interrupted forced
         // run's token resume a *normal* (since-bound) run in the wrong window.
         // Persist only the clear; the in-run cursor still drives forced paging.
-        $this->stateStore?->setCursor($key, $this->forceFullSync ? null : $next);
+        $this->cursorStore()?->setCursor($key, $this->forceFullSync ? null : $next);
     }
 
     /**
@@ -340,7 +376,12 @@ final class BatchSync
             if ($activityConfig !== null && $activityConfig->initialSync === 'now') {
                 $seed = new \DateTimeImmutable();
                 $this->stateStore->setLastSyncTime('activity', $seed);
-                $this->logger->info('Activity sync has no cursor — seeding to now; historical activities are not pushed (initial_sync: now)', [
+                // Warning, not info: this run pushes nothing, and the state it
+                // writes moves the window past everything older. On a genuine
+                // first run that is the point; reached AFTER a resetState() it
+                // silently discards the history the reset was meant to re-push,
+                // so it has to be visible either way. Use forceFullSync for that.
+                $this->logger->warning('Activity sync has no watermark — seeding to now; historical activities are NOT pushed (initial_sync: now). Use forceFullSync to push history.', [
                     'seeded' => $seed->format('c'),
                 ]);
 
@@ -560,13 +601,31 @@ final class BatchSync
             );
         }
 
+        // Same reasoning on the CC side: the export set is read through
+        // iterateEntity(), which is an opt-in capability. Aborting keeps the
+        // watermark where it is, so nothing edited meanwhile is lost.
+        if (!$this->ccAdapter instanceof SupportsEntityIterationInterface) {
+            $this->logger->error(
+                'Custom entity "{name}" is cc_to_crm but the CC adapter cannot enumerate entity rows',
+                ['name' => $entry->name],
+            );
+
+            throw NotSupportedException::operationNotSupported(
+                $this->ccAdapter::class,
+                sprintf('custom entity export for "%s" (SupportsEntityIterationInterface)', $entry->name),
+            );
+        }
+        $ccIterator = $this->ccAdapter;
+
         $since = $this->resolveSince($offsetKey);
 
         if ($since === null && !$this->forceFullSync && $this->stateStore !== null && $entry->initialSync === 'now') {
             $seed = new \DateTimeImmutable();
             $this->stateStore->setLastSyncTime($offsetKey, $seed);
-            $this->logger->info(
-                'Custom entity "{name}" export has no cursor — seeding to now; historical records are not pushed (initial_sync: now)',
+            // Warning for the same reason as the activity seed above: after a
+            // resetState() this run silently pushes nothing and re-seeds.
+            $this->logger->warning(
+                'Custom entity "{name}" export has no watermark — seeding to now; historical records are NOT pushed (initial_sync: now). Use forceFullSync to push history.',
                 ['name' => $entry->name, 'seeded' => $seed->format('c')],
             );
             $result->setExhausted(true);
@@ -589,9 +648,9 @@ final class BatchSync
         // the filtered set makes the second page's skip land past unread rows —
         // permanent loss once the window advances. The cap keeps all pagination
         // under the departure-aware offset below.
-        $batchLimit = min($this->config->batchSize, $this->ccAdapter::ITERATE_PAGE_SIZE);
+        $batchLimit = min($this->config->batchSize, $ccIterator::ITERATE_PAGE_SIZE);
 
-        foreach ($this->ccAdapter->iterateEntity($entry->source, $since, $offset, $entry->exportFilter, $entry->sinceField) as $row) {
+        foreach ($ccIterator->iterateEntity($entry->source, $since, $offset, $entry->exportFilter, $entry->sinceField) as $row) {
             $isFirstRow = $firstId === null;
             $firstId ??= isset($row['id']) ? (string) $row['id'] : '';
 
@@ -917,6 +976,10 @@ final class BatchSync
     {
         try {
             $mapped = $this->fieldMapper->map($activity, $mapping, SyncDirection::CcToCrm, $this->relationMaps);
+            if ($mapped === []) {
+                throw MappingException::emptyRuleSet('activity', $activity->getActivityType()?->value);
+            }
+
             $mappedActivity = Activity::fromArray($mapped);
 
             if ($activity->getActivityType() !== null) {
@@ -1068,6 +1131,10 @@ final class BatchSync
         ?\DateTimeImmutable $since,
         string $firstId,
     ): bool {
+        if (!$this->ccAdapter instanceof SupportsEntityIterationInterface) {
+            return false;
+        }
+
         try {
             foreach ($this->ccAdapter->iterateEntity($entry->source, $since, 0, $entry->exportFilter, $entry->sinceField) as $row) {
                 return isset($row['id']) && (string) $row['id'] === $firstId;

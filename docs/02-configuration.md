@@ -57,7 +57,7 @@ Each entity type (`contact`, `account`, `activity`) can be configured independen
 | `activity_types` | array | For activities only: which types to sync |
 | `activity_type_map` | map | For activities only: CC type → CRM activity type key (supports CRM-side custom types, e.g. `sms: sms`). The SDK loader validates the CC type keys; the map itself is consumed by the adapter *factory* (e.g. `PipedriveSyncEngineFactory` reads it from the raw config and passes it to the adapter) — the SDK core does not read it |
 | `link_deal` | string | For activities only: deal-linking strategy (e.g. `latest_open`) — requires an adapter implementing `SupportsDealLinkingInterface` |
-| `initial_sync` | string | `now` (default) — first run seeds the cursor and skips history; `everything` — first run exports all historical records |
+| `initial_sync` | string | `now` (default) — first run seeds the watermark and skips history; `everything` — first run exports all historical records. Note a reset does **not** undo `now`: see [Reset State](09-production-deployment.md#reset-state) |
 | `auto_create_contact` | object | Auto-create a contact from account data (see [Sync Engine](05-sync-engine.md#auto-create-contact-from-account)) |
 
 ### Activity Types
@@ -77,8 +77,12 @@ Available activity types for the `activity_types` config:
 ### `sync.custom_entities[]`
 
 Optional list of extra sync slots for arbitrary CRM-side resources (the
-`target` is adapter-interpreted, e.g. a REST path). `cc_to_crm` entries need an
-adapter implementing `SupportsCustomEntityWriteInterface`.
+`target` is adapter-interpreted, e.g. a REST path). `cc_to_crm` entries need a
+CRM adapter implementing `SupportsCustomEntityWriteInterface` (to write) and a
+Contact Centre adapter implementing `SupportsEntityIterationInterface` (to read
+the export set). The shipped `DaktelaAdapter` implements the latter; a custom CC
+adapter that doesn't gets a `NotSupportedException` for that slot only, so its
+watermark is never advanced over records it could not read.
 
 | Key | Type | Description |
 |-----|------|-------------|
@@ -88,7 +92,7 @@ adapter implementing `SupportsCustomEntityWriteInterface`.
 | `source` | string | CC-side entity (`contact`, `account`) (required) |
 | `target` | string | CRM-side resource name/path (required) |
 | `mapping_file` | string | Mapping file for the slot |
-| `initial_sync` | string | `now` (default) or `everything` |
+| `initial_sync` | string | `now` (default) or `everything` — see the note under `sync.entities[]` |
 | `export_filter` | list | `{field, operator, value}` conditions selecting which CC records export |
 | `write_back` | list | Inline mapping rules applied CRM→CC after create (typically stamps the prefixed CRM id back, which removes the record from the export filter) |
 

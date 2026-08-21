@@ -56,6 +56,17 @@ they exist to accumulate several values into one field, so both default and
 type append rules always survive the merge. Types without rules (and unknown
 types) get the default rules unchanged.
 
+**Every synced type must end up with at least one rule.** Because `default:` may
+be absent, a file declaring only `types:` gives an activity type that is missing
+from that map an *empty* rule set — a type listed in `activity_types` but not in
+`types:`, with no `default:` block, maps to nothing at all. The engine refuses to
+write that empty payload: the record fails with
+`Mapping for activity type "sms" produced an empty payload`, on the batch and
+webhook paths alike. Failing is deliberate — creating the blank CRM record
+instead would get it recorded in the idempotency ledger as exported, permanently
+and without retry. Add a `default:` block, or a `types:` entry per synced type;
+once the mapping is fixed, the next run exports the records properly.
+
 **Flattened activity fields.** The Daktela adapter flattens each activity's
 nested relations so rules can address them as scalars: `user_email`,
 `user_login`, `user_title`, `contact_name`, and `item_<field>` for every

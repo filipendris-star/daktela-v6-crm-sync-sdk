@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Daktela\CrmSync\Tests\Integration\Fakes;
 
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
+use Daktela\CrmSync\Adapter\SupportsEntityIterationInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Entity\Account;
 use Daktela\CrmSync\Entity\Activity;
@@ -16,7 +17,7 @@ use Daktela\CrmSync\Entity\Contact;
  * contacts/accounts keyed by lookup field, and can be configured to throw
  * for specific lookup values to simulate API failures.
  */
-final class FakeCcAdapter implements ContactCentreAdapterInterface
+final class FakeCcAdapter implements ContactCentreAdapterInterface, SupportsEntityIterationInterface
 {
     /** @var array<string, Contact> */
     public array $contacts = [];
