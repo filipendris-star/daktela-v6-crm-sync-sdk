@@ -122,8 +122,40 @@ final class WebhookHandlerTest extends TestCase
             $engine,
             new WebhookPayloadParser(),
             $secret,
-            new NullLogger(),
+            $this->logger ?? new NullLogger(),
         );
+    }
+
+    private ?\Psr\Log\LoggerInterface $logger = null;
+
+    /**
+     * Regression: an event whose prefix routes to nothing must not vanish.
+     *
+     * `igdm` reached this arm for a whole release — HTTP 200, zero records, no
+     * error, no failure counter, no retry, nothing above info level. The reply
+     * stays 200 (a Daktela automation can do nothing useful with a failure) but
+     * a warning has to name the event, or the next dropped channel is invisible
+     * the same way.
+     */
+    public function testAnUnroutableEventIsAnsweredButLoggedAsAWarning(): void
+    {
+        $logger = new \Daktela\CrmSync\Tests\Support\CapturingLogger();
+        $this->logger = $logger;
+
+        $secret = 'test-secret';
+        $response = $this->createHandler($secret)->handle($this->createRequest(
+            json_encode(['event' => 'sometypo_close', 'name' => 'activities_1'], JSON_THROW_ON_ERROR),
+            'application/json',
+            $secret,
+        ));
+
+        self::assertSame(200, $response->httpStatusCode, 'the automation still gets a 200');
+        self::assertSame(0, $response->syncResult->getTotalCount());
+
+        $warnings = $logger->messagesAt('warning');
+        self::assertCount(1, $warnings);
+        self::assertStringContainsString('sometypo_close', $warnings[0]);
+        self::assertStringContainsString('not routable', $warnings[0]);
     }
 
     private function createRequest(string $body, string $contentType, string $secret): ServerRequestInterface

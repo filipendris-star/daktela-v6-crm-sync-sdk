@@ -68,14 +68,37 @@ final class WebhookHandler
     private function route(WebhookPayload $payload): SyncResult
     {
         return match ($payload->entityType) {
+            // These two look the id up in the CRM, so entityId must be a CRM id:
+            // they serve CRM-side webhooks, not Daktela automations. A Daktela
+            // `contact_update` sends the Daktela record name, which the CRM does
+            // not know — every such event reports Skipped. See docs/06.
             'contact' => $this->syncEngine->syncContact($payload->entityId),
             'account' => $this->syncEngine->syncAccount($payload->entityId),
             'activity' => $this->syncEngine->syncActivity(
                 $payload->entityId,
                 $payload->activityType ?? ActivityType::Call,
             ),
-            default => $this->emptyResult(),
+            default => $this->unroutableEvent($payload),
         };
+    }
+
+    /**
+     * An event whose prefix maps to nothing still answers 200 with zero records
+     * — the sender is a Daktela automation and there is nothing useful it can do
+     * with a failure — but it must not be SILENT. An unrouted prefix meant a
+     * whole channel was dropped for a release with no signal anywhere: no error,
+     * no failure counter, no retry. A warning is what makes that visible in a
+     * day rather than in a customer's missing data.
+     */
+    private function unroutableEvent(WebhookPayload $payload): SyncResult
+    {
+        $this->logger->warning(
+            'Webhook event "{event}" is not routable (entity type "{entityType}") — nothing was synced. '
+            . 'Check the Daktela automation name against the event prefix table in docs/06.',
+            ['event' => $payload->event, 'entityType' => $payload->entityType],
+        );
+
+        return $this->emptyResult();
     }
 
     private function emptyResult(): SyncResult

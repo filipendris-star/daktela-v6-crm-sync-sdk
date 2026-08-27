@@ -95,6 +95,34 @@ final class WebhookPayloadParserTest extends TestCase
     }
 
     /**
+     * Regression: EVERY configurable activity type must route as an activity.
+     *
+     * `igdm` was added to the activity-type map but not the entity map, so
+     * entityType came back as "igdm" and WebhookHandler::route() dropped it via
+     * its default arm — HTTP 200, zero records, no retry, nothing logged. This
+     * asserts the property rather than one channel, so the next channel added to
+     * the enum cannot repeat it.
+     */
+    public function testEveryActivityTypeResolvesToTheActivityEntity(): void
+    {
+        foreach (ActivityType::cases() as $case) {
+            foreach (['create', 'close'] as $verb) {
+                $payload = $this->parser->parse($this->createJsonRequest([
+                    'event' => $case->value . '_' . $verb,
+                    'name' => 'activities_1',
+                ]));
+
+                self::assertSame(
+                    'activity',
+                    $payload->entityType,
+                    sprintf('event "%s_%s" must route as an activity', $case->value, $verb),
+                );
+                self::assertSame($case, $payload->activityType);
+            }
+        }
+    }
+
+    /**
      * @param array<string, mixed> $data
      */
     private function createJsonRequest(array $data): ServerRequestInterface

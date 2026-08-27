@@ -9,18 +9,6 @@ use Psr\Http\Message\ServerRequestInterface;
 
 final class WebhookPayloadParser
 {
-    private const EVENT_ENTITY_MAP = [
-        'contact' => 'contact',
-        'account' => 'account',
-        'call' => 'activity',
-        'email' => 'activity',
-        'web' => 'activity',
-        'sms' => 'activity',
-        'fbm' => 'activity',
-        'wap' => 'activity',
-        'vbr' => 'activity',
-    ];
-
     private const EVENT_ACTIVITY_TYPE_MAP = [
         'call' => ActivityType::Call,
         'email' => ActivityType::Email,
@@ -29,6 +17,7 @@ final class WebhookPayloadParser
         'fbm' => ActivityType::Messenger,
         'wap' => ActivityType::WhatsApp,
         'vbr' => ActivityType::Viber,
+        'igdm' => ActivityType::InstagramDm,
     ];
 
     public function parse(ServerRequestInterface $request): WebhookPayload
@@ -41,8 +30,17 @@ final class WebhookPayloadParser
 
         // Infer entity type from event name (e.g., "call_close" → "call" → activity)
         $eventPrefix = $this->extractEventPrefix($event);
-        $entityType = self::EVENT_ENTITY_MAP[$eventPrefix] ?? $eventPrefix;
+        // One map owns "is this prefix an activity". Everything else keeps its
+        // prefix as the entity type — `contact` and `account` route on their own
+        // names, anything unknown reaches WebhookHandler's warning arm.
+        //
+        // There used to be a second map listing the activity prefixes as well,
+        // and adding `igdm` to only one of them made Instagram DM webhooks
+        // resolve to entityType "igdm", which route() dropped: HTTP 200, zero
+        // records, no retry. What is left of that map was an identity lookup
+        // behind this same `??`, so it is gone.
         $activityType = self::EVENT_ACTIVITY_TYPE_MAP[$eventPrefix] ?? null;
+        $entityType = $activityType !== null ? 'activity' : $eventPrefix;
 
         return new WebhookPayload(
             entityType: $entityType,
