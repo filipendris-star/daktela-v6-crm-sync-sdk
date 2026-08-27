@@ -44,6 +44,7 @@ The companion package [`daktela/daktela-crm-integrations`](https://github.com/Da
 use Daktela\CrmSync\Adapter\Daktela\DaktelaAdapter;
 use Daktela\CrmSync\Config\YamlConfigLoader;
 use Daktela\CrmSync\Logging\StderrLogger;
+use Daktela\CrmSync\State\FileSyncStateStore;
 use Daktela\CrmSync\Sync\SyncEngine;
 
 $logger = new StderrLogger();
@@ -52,7 +53,8 @@ $config = (new YamlConfigLoader())->load('config/sync.yaml');
 $ccAdapter = new DaktelaAdapter($config->instanceUrl, $config->accessToken, $config->database, $logger);
 $crmAdapter = new YourCrmAdapter(/* ... */);
 
-$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger);
+$stateStore = new FileSyncStateStore(__DIR__ . '/var/sync-state.json');
+$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, stateStore: $stateStore);
 $engine->testConnections();
 
 $results = $engine->fullSync();
@@ -60,6 +62,13 @@ foreach ($results->toArray() as $type => $result) {
     echo $result->getSummary(ucfirst($type)) . "\n";
 }
 ```
+
+> **Activity export needs a state store.** With the default `initial_sync: now`
+> the engine seeds a watermark on the first run and pushes no history. Without a
+> state store there is nothing to seed, so the engine refuses rather than push the
+> full contact-centre history on every run. Pass `stateStore:` as shown in
+> `examples/bootstrap.php`. To push history on purpose, use
+> `fullSync(forceFullSync: true)` or `initial_sync: everything`.
 
 See [`examples/`](examples/) for full sync, incremental, single-record, and webhook examples.
 

@@ -55,6 +55,9 @@ Each entity type (`contact`, `account`, `activity`) can be configured independen
 | `direction` | string | `crm_to_cc`, `cc_to_crm`, or `bidirectional` |
 | `mapping_file` | string | Path to YAML mapping file (relative to config dir) |
 | `activity_types` | array | For activities only: which types to sync |
+| `activity_type_map` | map | For activities only: CC type → CRM activity type key (supports CRM-side custom types, e.g. `sms: sms`). The SDK loader validates the CC type keys; the map itself is consumed by the adapter *factory* (e.g. `PipedriveSyncEngineFactory` reads it from the raw config and passes it to the adapter) — the SDK core does not read it |
+| `link_deal` | string | For activities only: deal-linking strategy (e.g. `latest_open`) — requires an adapter implementing `SupportsDealLinkingInterface` |
+| `initial_sync` | string | `now` (default) — first run seeds the watermark and skips history; `everything` — first run exports all historical records. `now` **requires a state store**: without one there is no watermark to seed, so the activity export refuses to run rather than push full history on every run. `everything` runs without a state store but re-pushes on every run, so it warns. Note a reset does **not** undo `now`: see [Reset State](09-production-deployment.md#reset-state) |
 | `auto_create_contact` | object | Auto-create a contact from account data (see [Sync Engine](05-sync-engine.md#auto-create-contact-from-account)) |
 
 ### Activity Types
@@ -70,6 +73,65 @@ Available activity types for the `activity_types` config:
 | `fbm` | Facebook Messenger |
 | `wap` | WhatsApp |
 | `vbr` | Viber |
+| `igdm` | Instagram Direct |
+
+These values come from the webhook **event-prefix** namespace, which is not
+always the value the platform's API stores: `web` is `CHAT` on the API side.
+The SDK translates (`ActivityType::apiValue()`); configure the value in this
+table.
+
+**Only CLOSED activities are exported**, and an activity that never closes is
+never exported. Webhooks are the path for pushing one earlier in its life.
+
+The incremental window matches **either `time_close` or `time`**, because
+activities have no `edited` field and neither timestamp is a reliable change
+marker on its own:
+
+- `time` is the start, so it misses an activity that began before the watermark
+  and closed after it.
+- `time_close` misses one whose close time is older than its close *event*: the
+  platform writes `time_close` when an activity is postponed and then leaves it
+  alone when the activity finally closes, so a postponed-then-closed activity
+  carries a stale value. (Postponing applies to email, SMS and the chat channels —
+  never to calls.) A back-dated custom activity has the same shape.
+
+Matching on either covers strictly more than `time` alone did, and the
+adapter's upsert dedupes the overlap.
+
+**It is not complete.** Neither timestamp moves when an activity *closes* after
+being postponed, so an activity postponed before a run and closed after it has
+both fields behind the watermark and is never exported by any later run — the
+loss is silent and permanent, and only a forced run recovers it. This affects the
+postponable channels (email, SMS, chat), never calls. There is no field that
+would fix it: activities carry no `edited`, and `action` becoming `CLOSE` is not
+a timestamp. If your deployment postpones heavily, schedule a periodic
+`fullSync(forceFullSync: true)`.
+
+### `sync.custom_entities[]`
+
+Optional list of extra sync slots that import an arbitrary CRM-side resource
+into a first-class Daktela entity (`crm_to_cc` only in this release; the
+`target` is adapter-interpreted, e.g. a REST path).
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | Unique slot name (required) — also the state key (`custom:<name>`) |
+| `enabled` | bool | Default `false` |
+| `direction` | string | `crm_to_cc` (required) |
+| `source` | string | CRM-side resource name/path (required) |
+| `target` | string | Daktela entity to write (`contact`, `account`) (required) |
+| `mapping_file` | string | Mapping file for the slot |
+
+```yaml
+sync:
+  custom_entities:
+    - name: leads
+      enabled: true
+      direction: crm_to_cc
+      source: leads
+      target: contact
+      mapping_file: mappings/leads.yaml
+```
 
 ### `webhook`
 | Key | Type | Description |

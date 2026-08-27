@@ -129,7 +129,57 @@ $record->errorMessage;  // Error details (null if successful)
 
 ## fullSync() Error Handling
 
-When using `fullSync()`, each entity type has its own `SyncResult`. A failure in account sync does not prevent contact sync from running:
+When using `fullSync()`, each entity type has its own `SyncResult`. A failure in
+one entity does not prevent any other from running: steps are not gated on each
+other's outcome. A later step that needs a relation the account step would have
+mapped resolves it per record instead, and fails only the records it genuinely
+cannot resolve — see [Field Mapping](03-field-mapping.md#how-it-works). Gating
+whole steps stalled every dependent entity for as long as one account was broken,
+while still missing the case that motivated it (a *partial* account failure leaves
+the step "ok" and the relation map incomplete).
+
+Two failure levels exist and they need different handling:
+
+- **per-record** failures — `$result->getFailedCount()`, individual records the
+  other records' success is unaffected by. The entity's sync window still
+  advances (unless *every* record failed), so a failed record is **not** re-offered
+  on the next run: its source timestamp has not moved. Read the failures off
+  `SyncResult` and re-drive them if that matters to you.
+- One per-record failure worth recognising is an **unresolved relation**:
+
+  ```
+  Cannot resolve account reference "crm-a9": syncing it failed (…).
+  Refusing to write the unresolved CRM id.
+  ```
+
+  The referenced entity exists in the CRM but could not be synced (CRM
+  unreachable, Daktela write rejected), so the record is failed rather than
+  written with a raw CRM foreign key in a relation field — see
+  [Field Mapping](03-field-mapping.md#how-it-works). The record is absent from
+  Daktela until the referenced entity syncs and the source record is touched
+  again, or a forced full sync runs. Recovering the account and re-running with
+  `forceFullSync` is the fix.
+- **step-level** failures — `$results->stepFailures` (entity type => message),
+  a whole step that failed: an adapter fault, a misconfiguration, or every one of
+  its records failing. The step's sync window is deliberately **not** advanced, so
+  nothing edited during the outage falls out of the incremental window.
+
+`fullSync()` returns normally even when steps failed, so a scheduler must check
+`hasStepFailures()` — otherwise a total outage looks like a successful run:
+
+```php
+$results = $engine->fullSync();
+
+if ($results->hasStepFailures()) {
+    foreach ($results->stepFailures as $entityType => $error) {
+        $logger->error('{type} sync step failed: {error}', ['type' => $entityType, 'error' => $error]);
+    }
+
+    exit(1); // the run did not sync everything it was asked to
+}
+```
+
+Per-record failures are reported per entity:
 
 ```php
 $results = $engine->fullSync();
@@ -175,13 +225,14 @@ use Daktela\CrmSync\Logging\StderrLogger;
 $logger = new StderrLogger();
 // Output: [2026-02-27 14:30:00] INFO: Syncing contact {id}
 
-$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger);
+$stateStore = new FileSyncStateStore(__DIR__ . '/var/sync-state.json');
+$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, stateStore: $stateStore);
 ```
 
 `SyncEngineFactory` uses `StderrLogger` by default. Pass your own logger (e.g. Monolog) to override:
 
 ```php
-$factory = SyncEngineFactory::fromYaml('config/sync.yaml', logger: $monolog);
+$factory = SyncEngineFactory::fromYaml('config/sync.yaml', $crmAdapter, logger: $monolog, stateStorePath: 'var/sync-state.json');
 ```
 
 Log levels used:

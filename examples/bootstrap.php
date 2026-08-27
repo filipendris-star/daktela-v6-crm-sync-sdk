@@ -21,6 +21,7 @@ require_once __DIR__ . '/../vendor/autoload.php';
 use Daktela\CrmSync\Adapter\Daktela\DaktelaAdapter;
 use Daktela\CrmSync\Config\YamlConfigLoader;
 use Daktela\CrmSync\Logging\StderrLogger;
+use Daktela\CrmSync\State\FileSyncStateStore;
 use Daktela\CrmSync\Sync\SyncEngine;
 
 // --- Logger (replace with Monolog or your PSR-3 logger in production) ---
@@ -52,4 +53,9 @@ if ($crmAdapter === null) {
 }
 
 // --- Create the sync engine ---
-$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger);
+// A state store is REQUIRED when the activity export uses the default
+// `initial_sync: now`: without a watermark to seed, every run would push the
+// full contact-centre history to the CRM, not just the first.
+$stateStore = new FileSyncStateStore(__DIR__ . '/../var/sync-state.json');
+
+$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, stateStore: $stateStore);

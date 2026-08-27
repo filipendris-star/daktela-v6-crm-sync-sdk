@@ -41,7 +41,7 @@ A production deployment consists of three runtime components:
 
 ## Incremental Sync Setup
 
-Without a state store, every `fullSync()` call re-syncs all records from scratch. The `FileSyncStateStore` enables incremental sync by saving the last successful sync timestamp per entity type.
+Without a state store, every `fullSync()` call re-syncs all records from scratch. For the activity EXPORT with `initial_sync: now` (the default) this is refused outright, because re-pushing the full contact-centre history on every run is never intended. The `FileSyncStateStore` enables incremental sync by saving the last successful sync timestamp per entity type.
 
 ### Wiring (using SyncEngineFactory)
 
@@ -79,11 +79,23 @@ $engine = new SyncEngine(
 
 ### Safety Guarantees
 
-The engine automatically loops through all batches for each entity type. State is **only** saved after all batches complete, and only when:
+The engine loops through all batches for an entity type before saving that
+entity's timestamp, and withholds it entirely when **every** record failed — so
+a total outage re-covers the same window on the next run.
 
-- **No failures** — if any record fails to sync in any batch, the timestamp is not updated (so the next run retries all records from the same point)
+**A partial failure still advances the timestamp.** Individually failed records
+are reported in `SyncResult`, but they are *not* re-offered on the next run:
+their source timestamp has not moved, so they fall outside the incremental
+window. If you need them retried, read the failures off `SyncResult` and
+re-drive them, or run a forced full sync. Do not assume a failed record comes
+back on its own.
 
-This means the engine will never skip records due to a partial sync or per-batch failures.
+**Give the scheduled run a timeout.** The SDK trusts an adapter's pagination: a
+fresh page token means "there is more", however many record-less pages precede
+it, because a filtered search legitimately scans many. An adapter whose
+`has_more` never turns false therefore drains until it is stopped, so bounding a
+run's total work belongs to whatever schedules it (`timeout`, a systemd
+`RuntimeMaxSec`, or equivalent).
 
 ### State File
 
@@ -323,7 +335,7 @@ Use cases: initial data load, data corruption recovery, after mapping changes.
 
 ### Reset State
 
-Clear saved timestamps so the next sync run processes all records:
+Clear saved timestamps so the next sync run starts without an incremental window:
 
 ```php
 // Reset all entity types
@@ -332,6 +344,29 @@ $engine->resetState();
 // Reset a single entity type
 $engine->resetState('contact');
 ```
+
+**A reset alone does not re-push history for exports.** Clearing a watermark
+makes the next run look like a *first* run, and a first run of a `cc_to_crm`
+entity with `initial_sync: now` (the default — activities; custom-entity export
+is not part of this release and has no seed rail) seeds the watermark back to
+now and pushes nothing. That run reports
+`0 total, 0 failed` and looks clean while the history stays permanently outside
+the window. `resetState()` logs a warning naming the affected entities, and so
+does the run that re-seeds.
+
+Imports (`crm_to_cc`: contacts, accounts) have no seed rail, so a reset does
+exactly what it says for them.
+
+To actually re-drive history, use a forced run — it ignores both the watermark
+and the seed rail, so no reset is needed at all:
+
+```php
+$engine->fullSync(forceFullSync: true);
+```
+
+Or set `initial_sync: everything` on the entity, which makes a first run push
+full history. `forceFullSync` is the better tool for a one-off recovery: it is a
+per-run decision rather than a config change someone has to remember to revert.
 
 ### Monitoring
 

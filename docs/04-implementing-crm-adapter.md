@@ -173,12 +173,19 @@ final class SalesforceCrmAdapter implements CrmAdapterInterface
             $this->client->update('Task', $id, $activity->toArray());
             return Activity::fromArray(array_merge($activity->toArray(), ['id' => $id]));
         } catch (\Throwable $e) {
+            // Every failure here is a failure: this method has no null to return,
+            // and the SDK has no re-create recovery, so a "gone" record and a
+            // timeout reach the caller the same way. Keep the message specific so
+            // the operator can tell them apart in the log.
             throw AdapterException::updateFailed('activity', $id, $e);
         }
     }
 
     public function upsertActivity(string $lookupField, Activity $activity): Activity
     {
+        // Called for EVERY exported activity. If your
+        // CRM cannot search activities, catch that here and create instead —
+        // letting findActivityByLookup() throw would fail every export.
         $lookupValue = $activity->get($lookupField);
         if ($lookupValue !== null) {
             $existing = $this->findActivityByLookup($lookupField, (string) $lookupValue);
@@ -224,6 +231,35 @@ final class SalesforceCrmAdapter implements CrmAdapterInterface
     }
 }
 ```
+
+## Optional Capability Interfaces
+
+Beyond `CrmAdapterInterface`, an adapter can opt into extra behavior by
+implementing capability interfaces. The engine feature-detects them with
+`instanceof` — adapters that don't implement one keep the default path.
+
+### `SupportsCursorPaginationInterface`
+
+For CRMs whose list APIs paginate by an opaque cursor (HubSpot `after`,
+Pipedrive v2 `cursor`, K2 `NextPageURL`) instead of a numeric offset.
+Implement `fetchContactsPage()` / `fetchAccountsPage()` returning a
+`CursorPage(records, nextCursor)`. The engine hands `nextCursor` back on the
+next page, so a drain completes within one run however many pages it takes.
+It is NOT persisted between runs: an interrupted drain restarts from the
+watermark, re-reading pages it already processed rather than resuming past
+them (see [Incremental Sync](05-sync-engine.md#incremental-sync) for why).
+Return `nextCursor: null` on the last page — that, and only that,
+ends the drain: neither a short page nor an empty one does, because filtered
+searches legitimately return fewer rows than the limit (possibly none at all)
+while more pages remain. Never return the token you were given — a page that
+cannot advance the cursor is treated as an adapter fault and aborts the drain.
+
+
+### `SupportsDealLinkingInterface`
+
+Lets the engine link an exported activity to a CRM deal per the entity
+config's `link_deal` strategy (e.g. `latest_open`). Implement
+`linkActivityToDeal(Activity $activity, string $strategy): Activity`.
 
 ## Read-Only Adapters (No Activity Support)
 

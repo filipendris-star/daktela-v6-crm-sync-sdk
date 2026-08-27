@@ -6,7 +6,7 @@ Field mappings define how data is translated between Daktela CC fields and CRM f
 
 ```yaml
 entity: contact          # Entity type
-lookup_field: email      # Field used for upsert lookups
+lookup_field: email      # Field used for upsert lookups (see note below)
 mappings:
   - cc_field: title      # Daktela CC field name
     crm_field: full_name # CRM field name
@@ -21,6 +21,96 @@ mappings:
       resolve_from: id
       resolve_to: name
 ```
+
+## Per-Activity-Type Rules (`default` / `types`)
+
+Activity mapping files support a structured form: shared rules under
+`default:`, per-type overrides under `types:` keyed by activity type
+(`call`, `sms`, `email`, ...). Use either this structure or the legacy
+top-level `mappings:` — not both. Empty keys (`mappings: {}`, `default: {}`)
+emitted by config UIs are tolerated and treated as absent.
+
+```yaml
+entity: activity
+lookup_field: externalId
+default:
+  mappings:
+    - { cc_field: name, crm_field: externalId }
+    - { cc_field: title, crm_field: subject }
+types:
+  call:
+    mappings:
+      - cc_field: item_call_state
+        crm_field: done
+        transformers:
+          - { name: value_map, params: { map: { in_missed: 0 }, default: 1 } }
+  sms:
+    mappings:
+      - { cc_field: item_text, crm_field: note }
+```
+
+**Merge semantics** (`MappingCollection::forType()`): a non-append type rule
+*replaces* the non-append default rule targeting the same output field, in
+place; anything else is appended. `append: true` rules are never deduped —
+they exist to accumulate several values into one field, so both default and
+type append rules always survive the merge. Types without rules (and unknown
+types) get the default rules unchanged.
+
+**Every synced type must end up with at least one rule.** Because `default:` may
+be absent, a file declaring only `types:` gives an activity type that is missing
+from that map an *empty* rule set — a type listed in `activity_types` but not in
+`types:`, with no `default:` block, maps to nothing at all. The engine refuses to
+write that empty payload: the record fails with
+`Mapping for activity type "sms" produced an empty payload`, on the batch and
+webhook paths alike. Failing is deliberate — creating the blank CRM record
+instead would advance the watermark past it, permanently
+and without retry. Add a `default:` block, or a `types:` entry per synced type;
+once the mapping is fixed, the next run exports the records properly.
+
+**Flattened activity fields.** The Daktela adapter flattens each activity's
+nested relations so rules can address them as scalars: `user_email`,
+`user_login`, `user_title`, `contact_name`, and `item_<field>` for every
+scalar field of the type-specific item record (`item_direction`,
+`item_answered`, `item_text`, ...). For any item carrying **both**
+`item_direction` and `item_answered` it also derives **`item_call_state`** —
+one token (`out_answered`, `out_noanswer`, `in_answered`, `in_missed`,
+`internal_answered`, `internal_noanswer`) that a single `value_map` can turn
+into a CRM `done` flag or subject, which two separate fields cannot express.
+Calls, emails and the chat channels all qualify; the direction is matched
+case-insensitively, since the platform stores it lowercase for calls and
+emails but uppercase for the chat family. An item without `item_answered`
+(so no answered/unanswered distinction exists) gets no `item_call_state` at
+all rather than a guessed one.
+
+**`lookup_field` addresses different sides per direction.** On import
+(`crm_to_cc`) the upsert looks up the *CC-side* record, so `lookup_field`
+names a CC field. On export (`cc_to_crm`) the
+existence check runs against the *mapped CRM payload*, so it must name the
+CRM-side field your mapping writes, and that field must carry a per-record
+value. A mapping file copied from an import and flipped to export usually needs
+its `lookup_field` changed.
+
+**A missing lookup value is always refused.** If the mapped payload carries no
+value at `lookup_field` — because it names a `cc_field`, because the only rule
+writing it lives under a `types:` block that did not apply, or because it is a
+dotted path (the mapper writes `crm_field: custom.daktela_id` as a nested array,
+and the lookup reads the payload flat) — the batch export aborts the activity
+step. It aborts rather than failing that record, so the watermark is held and
+nothing falls outside the next window.
+
+**A non-varying lookup value is only *sometimes* detected — do not rely on it.**
+A static rule, or a default that fires for every activity, produces one value for
+everything, so every activity resolves to the same CRM record and overwrites the
+last. The export refuses this when it can see it: when two activities read in the
+same drain share a value. It cannot see it when the drain holds a single record
+(`batch_size: 1`, or a quiet tenant where each incremental run picks up one
+activity), when the colliding activities land in different drains, or on the
+webhook path at all — that path handles one event and keeps no memory between
+them.
+
+So: **check yourself that `lookup_field` names a field carrying a distinct value
+per activity.** The Daktela activity `name` mapped into a CRM field is the
+reliable choice. The SDK will catch the obvious mistakes, not all of them.
 
 ## Direction
 
@@ -139,7 +229,36 @@ When syncing contacts, you often need to resolve references to other entities. F
 2. The engine builds a resolution map: `CRM account.id → Daktela account.name`
 3. When syncing contacts, the mapper sees `company_id = "crm-acc-123"` and resolves it to `account = "acme"` using the map
 4. If a referenced entity is missing from the map, the engine auto-fetches it from the CRM and syncs it on-the-fly (with recursion protection)
-5. If a value still cannot be resolved (entity not found in CRM), the original value is passed through unchanged
+5. If the entity does not exist in the CRM, the original value is passed through unchanged
+6. If the entity exists but syncing it **failed** (CRM unreachable, Daktela write rejected), the referencing record fails instead
+
+Two cases fall outside 5 and 6 and still pass the value through: no mapping is
+configured for the referenced entity type, and the recursion guard declining a
+reference already being resolved higher up the stack. Neither attempted a
+resolution, so neither is reported as a failure.
+
+Steps 5 and 6 look the same from the mapper's side and must not be treated the
+same. Passing an unresolved value through is only correct when there is genuinely
+nothing to resolve to; doing it after a *failed* attempt writes a raw CRM foreign
+key into a Daktela relation field and reports the record as synced, so the
+watermark advances past a wrong link no later run revisits.
+
+Failing the individual record instead keeps this scale-free: unaffected records
+in the same batch keep syncing.
+
+Be aware of what a failed record does and does not get you. It is reported in
+`SyncResult` and it is *not* written with a bad link — but it is not retried
+automatically either: the watermark still advances as long as some record
+succeeded (see [Error Handling](07-error-handling.md)), so the record stays
+outside the incremental window until its source timestamp changes again or a
+forced full sync runs. The trade is "absent and reported" over "present and
+silently wrong". If a host needs the stronger guarantee, it should watch
+`SyncResult` for failed records and re-drive them.
+
+Steps are not gated on each other for this — gating the whole contact step on
+"the account step failed" stalls every contact for as long as one account is
+broken, and still misses a *partial* account failure, which is the case that
+actually produces unresolved references.
 
 ### Using fullSync()
 
@@ -165,7 +284,8 @@ $engine->syncContactsBatch(); // Resolves account references; auto-syncs missing
 ## Built-in Transformers
 
 ### `date_format`
-Converts between date formats using PHP's `DateTimeImmutable`.
+Converts between date formats using PHP's `DateTimeImmutable`, with optional
+timezone conversion.
 
 ```yaml
 transformers:
@@ -173,9 +293,64 @@ transformers:
     params:
       from: "Y-m-d H:i:s"   # Source format
       to: "c"                # Target format (ISO 8601)
+      from_tz: "Europe/Prague"  # Optional: timezone the input wall-time is in
+                                # (default: the process/instance timezone)
+      to_tz: "UTC"              # Optional: convert to this zone before formatting
 ```
 
 If the source value doesn't match the `from` format, the transformer attempts generic parsing as a fallback.
+
+**Timezone conversion.** The Daktela v6 API returns naive local datetimes. When
+the target CRM interprets times as UTC (e.g. Pipedrive `due_date`/`due_time`),
+set `to_tz: UTC` so the instant is shifted before formatting — otherwise
+activities land offset by the local UTC offset. Named zones handle DST per
+date: a Prague summer time converts at +2 h, a winter time at +1 h.
+
+```yaml
+# Pipedrive due_date/due_time from one CC timestamp — both convert as one instant
+- cc_field: time
+  crm_field: due_date
+  transformers:
+    - { name: date_format, params: { from: 'Y-m-d H:i:s', to: 'Y-m-d', to_tz: 'UTC' } }
+- cc_field: time
+  crm_field: due_time
+  transformers:
+    - { name: date_format, params: { from: 'Y-m-d H:i:s', to: 'H:i', to_tz: 'UTC' } }
+```
+
+Fields the `from` format leaves unspecified are anchored to zero (not filled
+from the current time).
+
+**`to_tz` converts what `from` declares.** Two conditions, both read off the
+config: `from` must parse a time of day, and the value must actually match it.
+Nothing about the value is inspected or guessed.
+
+The defaults are Daktela's own shape — `from: 'Y-m-d H:i:s'`, which is what the
+v6 API emits for every `ItemDescription::DateTime` field — so the common CC→CRM
+case needs no extra configuration beyond the target zone.
+
+For anything else, **declare the format the source emits** and it converts:
+
+| Source shape | `from` |
+|---|---|
+| `2024-06-01 14:30:00` (Daktela) | `Y-m-d H:i:s` (default) |
+| `2024-06-01T14:30:00+02:00` or `…Z` | `Y-m-d\TH:i:sP` |
+| `1717245000` (unix epoch) | `U` |
+| `01.06.2024 14:30:00` | `d.m.Y H:i:s` |
+
+Two rules follow, and they are the whole of the behaviour:
+
+- **A value that does not match `from`** is still parsed generically and
+  reformatted (legacy behaviour), but never zone-shifted. If timestamps come out
+  unconverted, `from` does not describe the data — fix `from`.
+- **A date-only `from`** (`Y-m-d`) never converts, whatever an individual value
+  contains. A date is not an instant: shifting `2026-08-19` into UTC would emit
+  `2026-08-18` on any instance east of UTC while silently "working" west of it.
+
+This is declared rather than detected on purpose. Whether an arbitrary value is
+an instant is not decidable — PHP's parser reports hour, minute and second all
+zero for both `today` and a real midnight, so a calendar date and a genuine
+midnight are indistinguishable after parsing. `from` already carries the answer.
 
 ### `phone_normalize`
 Strips all non-digit/non-plus characters and optionally prepends `+` for E.164 format.
@@ -229,7 +404,8 @@ $callback->registerCallback('normalize_country', function (mixed $value): string
     };
 });
 
-$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, $registry);
+$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, $registry,
+    stateStore: new FileSyncStateStore('var/sync-state.json'));
 ```
 
 ```yaml
@@ -261,6 +437,20 @@ transformers:
 ```
 
 Example: `"crm_12345"` → `"12345"`. If the value doesn't start with the prefix, it is returned unchanged.
+
+### `value_map`
+Maps discrete input values to configured outputs. YAML keys are strings —
+booleans match as `"true"`/`"false"`, null as `"null"`. Without `default`,
+unmatched input passes through unchanged.
+
+```yaml
+# Derive Pipedrive activity "done" from the derived call state:
+transformers:
+  - name: value_map
+    params:
+      map: { in_missed: 0 }   # missed inbound call → open/overdue task
+      default: 1              # everything else → completed
+```
 
 ### `wrap_array`
 Wraps a scalar value in an array. Already-array values are returned as-is, null/empty values become `[]`. Useful when Daktela expects array custom fields but the CRM provides a single value.
@@ -373,7 +563,8 @@ class CurrencyTransformer implements ValueTransformerInterface
 $registry = TransformerRegistry::withDefaults();
 $registry->register(new CurrencyTransformer());
 
-$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, $registry);
+$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, $registry,
+    stateStore: new FileSyncStateStore('var/sync-state.json'));
 ```
 
 ```yaml

@@ -16,6 +16,7 @@ use Daktela\CrmSync\Mapping\FieldMapping;
 use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\RelationConfig;
 use Daktela\CrmSync\Sync\SyncDirection;
+use Daktela\CrmSync\State\FileSyncStateStore;
 use Daktela\CrmSync\Sync\SyncEngine;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
@@ -35,12 +36,17 @@ class MySyncTest extends TestCase
                 Contact::fromArray(array_merge($contact->toArray(), ['id' => 'cc-1']))
             );
 
-        $engine = new SyncEngine($ccAdapter, $crmAdapter, $this->createConfig(), new NullLogger());
+        $engine = new SyncEngine($ccAdapter, $crmAdapter, $this->createConfig(), new NullLogger(),
+            stateStore: new FileSyncStateStore(sys_get_temp_dir() . '/state-' . bin2hex(random_bytes(6)) . '.json'));
         $result = $engine->syncContactsBatch();
 
         self::assertSame(0, $result->getFailedCount());
         self::assertSame(2, $result->getTotalCount());
     }
+
+    // Capability interfaces are feature-detected with instanceof, so a plain
+    // mock of a base interface does NOT satisfy them — mock the intersection
+    // when the code under test needs one.
 
     private function generateContacts(): \Generator
     {
@@ -173,7 +179,8 @@ public function testFullSyncResolvesAccountReferences(): void
             return Contact::fromArray(array_merge($contact->toArray(), ['id' => 'cc-c-1']));
         });
 
-    $engine = new SyncEngine($ccAdapter, $crmAdapter, $config, new NullLogger());
+    $engine = new SyncEngine($ccAdapter, $crmAdapter, $config, new NullLogger(),
+        stateStore: new FileSyncStateStore(sys_get_temp_dir() . '/state-' . bin2hex(random_bytes(6)) . '.json'));
     $results = $engine->fullSync();
 
     self::assertNotNull($results->account);
@@ -197,7 +204,7 @@ $handler = new WebhookHandler(
 );
 
 // Valid webhook request
-$request = new ServerRequest('POST', '/webhook')
+$request = (new ServerRequest('POST', '/webhook'))
     ->withHeader('Content-Type', 'application/json')
     ->withHeader('X-Webhook-Secret', 'test-secret');
 
@@ -215,7 +222,7 @@ self::assertSame(200, $result->httpStatusCode);
 **Testing invalid secret:**
 
 ```php
-$request = new ServerRequest('POST', '/webhook')
+$request = (new ServerRequest('POST', '/webhook'))
     ->withHeader('X-Webhook-Secret', 'wrong-secret');
 
 $result = $handler->handle($request);

@@ -176,12 +176,13 @@ Pass a custom `TransformerRegistry` to the engine:
 $registry = TransformerRegistry::withDefaults();
 $registry->register(new MyCustomTransformer());
 
-$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, $registry);
+$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, $registry,
+    stateStore: new FileSyncStateStore('var/sync-state.json'));
 ```
 
 ## Incremental Sync
 
-By default, every batch sync fetches all records. To enable incremental sync, pass a `SyncStateStoreInterface` implementation to the engine. The SDK ships with `FileSyncStateStore`:
+By default, every batch sync fetches all records. (An activity export with `initial_sync: now` needs a state store — see the note below.) To enable incremental sync, pass a `SyncStateStoreInterface` implementation to the engine. The SDK ships with `FileSyncStateStore`:
 
 ```php
 use Daktela\CrmSync\State\FileSyncStateStore;
@@ -199,12 +200,18 @@ $engine = new SyncEngine(
 
 **Behavior:**
 
-- **First run** (no saved state) — full sync, same as without a state store
+- **First run** (no saved state) — full sync for imports; an activity export with `initial_sync: now` seeds the watermark and pushes nothing
 - **Subsequent runs** — the saved timestamp is passed as `$since` to adapter `iterate*()` methods, so only records modified since the last successful sync are returned
 
 **When state is saved:**
 
-State is saved after all batches for an entity type have been processed, but only if zero records failed across the entire run. If any record fails in any batch, the timestamp is not updated — the next run retries from the same point. See the [Production Deployment](09-production-deployment.md) guide for details on safety guarantees.
+State is saved after all batches for an entity type have been processed, unless *every* record failed — that is the only case in which the timestamp is withheld and the next run re-covers the same window. A **partial** failure still advances the timestamp, so individually failed records fall outside the next incremental window until their source timestamp changes again or a forced full sync runs; watch `SyncResult` for them if you need to re-drive them. See the [Production Deployment](09-production-deployment.md) guide for details on safety guarantees.
+
+### Implementing your own state store
+
+`SyncStateStoreInterface` is four methods — two watermark accessors, `clear()`, `clearAll()` — and stays that way: new needs land in opt-in capability interfaces next to it, never as new required methods, so a DB- or Redis-backed store you wrote against an older SDK keeps loading.
+
+**Pagination position is not part of it.** Offsets and cursors live in memory for the duration of a run. A position is only meaningful together with the moment its drain started, so persisting the two separately let a resumed drain write a fresh watermark over records it had never re-read. An interrupted drain therefore restarts from the watermark on the next run: pages already processed are re-read — the adapter's upsert dedupes them — and nothing is skipped.
 
 ## Auto-Create Contact from Account
 
@@ -289,6 +296,74 @@ Use cases:
 - After modifying field mapping configuration
 
 The force flag is temporary — it only applies to that single `fullSync()` call. Subsequent calls resume incremental behavior.
+
+The flag makes the run **ignore** both incremental inputs — the per-entity
+`lastSyncTime` and any resume cursor — because a cursor-paginated adapter would
+otherwise resume mid-drain from a stale token instead of starting over.
+
+`lastSyncTime` is left untouched, so an ordinary run afterwards picks up its own
+incremental window as before. Pagination position is not stored at all, so there
+is nothing else for the flag to ignore across runs. To clear the timestamps, use
+[`resetState()`](09-production-deployment.md#reset-state).
+
+## Activity Export Dedup
+
+Activities go one way: Daktela → CRM. Nothing on the CRM side is read back, so
+the only thing preventing a second copy on a re-run is the adapter's
+`upsertActivity()` — look the record up by the mapping's `lookup_field`, update
+it if found, create it if not.
+
+```php
+public function upsertActivity(string $lookupField, Activity $activity): Activity
+{
+    $lookupValue = $activity->get($lookupField);
+    if ($lookupValue !== null) {
+        $existing = $this->findActivityByLookup($lookupField, (string) $lookupValue);
+        if ($existing !== null && $existing->getId() !== null) {
+            return $this->updateActivity($existing->getId(), $activity);
+        }
+    }
+
+    return $this->createActivity($activity);
+}
+```
+
+Map the Daktela activity id into a CRM field and point `lookup_field` at it, so
+the adapter has something stable to find the record by.
+
+Both paths — the scheduled batch export and the webhook export — call this same
+method and report the same verdict: `Updated`, meaning "the CRM now matches".
+Upsert does not say which branch it took, and that is the one verdict never wrong.
+
+They differ deliberately in **how they handle a mapping that cannot dedupe**. The
+batch path aborts the whole activity step, because a per-record failure there is
+a partial failure and the watermark would advance past the refused records. The
+webhook path reports a failed record instead: it handles one event and keeps no
+watermark, so there is nothing to protect by aborting, and the caller needs the
+failure in the HTTP response. The batch path also checks whether two activities
+in one drain share a lookup value; the webhook path cannot, having no memory
+between events.
+
+**If your CRM cannot search activities server-side**, `upsertActivity()` has
+nothing to find and will create on every run. Two things bound that in practice:
+the watermark means an activity is normally read once, and `initial_sync: now`
+means history is never pushed at all. Beyond that, a CRM with no activity search
+will accumulate duplicates. Not only on a replayed window (a held watermark
+after a failed run, a `forceFullSync`, a reset) but in ordinary operation: one
+call emits `call_create` → `call_answer` → `call_close`, and each webhook event
+creates its own record — budget for a periodic dedup on the CRM
+side, or store the Daktela id on the CRM record and give `upsertActivity()` a way
+to query it.
+
+> An earlier version of this SDK shipped a host-supplied idempotency ledger
+> (`setLedger()`, `SyncLedgerInterface`) that recorded exported activity ids so a
+> re-run could skip them. It was removed before release: it duplicated what
+> `upsertActivity()` already does, its skip suppressed legitimate updates, and
+> its key had no per-integration dimension, so two integrations sharing a store
+> collided. If you need it back for a CRM that genuinely cannot search
+> activities, it can return as an opt-in — please raise it with a concrete
+> adapter rather than assuming it exists.
+
 
 ## Reset State
 

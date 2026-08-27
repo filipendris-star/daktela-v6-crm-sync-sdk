@@ -96,7 +96,10 @@ Create `config/mappings/activities.yaml`:
 
 ```yaml
 entity: activity
-lookup_field: name
+# The CRM-side field the mapping writes the Daktela id into. On export the
+# existence check runs against the mapped CRM payload, so this must name a
+# crm_field below — naming a cc_field makes every run create a duplicate.
+lookup_field: external_id
 mappings:
   - cc_field: name
     crm_field: external_id
@@ -129,6 +132,7 @@ See [Implementing a CRM Adapter](04-implementing-crm-adapter.md) for a complete 
 use Daktela\CrmSync\Adapter\Daktela\DaktelaAdapter;
 use Daktela\CrmSync\Config\YamlConfigLoader;
 use Daktela\CrmSync\Logging\StderrLogger;
+use Daktela\CrmSync\State\FileSyncStateStore;
 use Daktela\CrmSync\Sync\SyncEngine;
 
 $logger = new StderrLogger();
@@ -143,8 +147,16 @@ $ccAdapter = new DaktelaAdapter(
 
 $crmAdapter = new YourCrmAdapter(/* your CRM connection params */);
 
-$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger);
+$stateStore = new FileSyncStateStore(__DIR__ . '/var/sync-state.json');
+$engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, stateStore: $stateStore);
 ```
+
+> **Activity export needs a state store.** With the default `initial_sync: now`
+> the engine seeds a watermark on the first run and pushes no history. Without a
+> state store there is nothing to seed, so the engine refuses rather than push the
+> full contact-centre history on every run. Pass `stateStore:` as shown in
+> `examples/bootstrap.php`. To push history on purpose, use
+> `fullSync(forceFullSync: true)` or `initial_sync: everything`.
 
 ### 5. Run a Sync
 

@@ -1,5 +1,9 @@
 entity: activity
-lookup_field: name
+# The CRM-side field carrying the Daktela activity id. This is the ONLY thing
+# preventing duplicate CRM activities on a replayed window or a multi-event
+# webhook call, and the check runs against the MAPPED CRM payload — so it must
+# name a crm_field below, never a cc_field.
+lookup_field: external_id
 mappings:
   - cc_field: name
     crm_field: external_id

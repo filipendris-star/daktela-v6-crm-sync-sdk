@@ -60,6 +60,7 @@ Repeat for other activity types:
 - `After Facebook message create` (`fbm_create`)
 - `After WhatsApp message create` (`wap_create`)
 - `After Viber message create` (`vbr_create`)
+- `After Instagram message create` (`igdm_create`)
 
 **For Contacts (CRM → Daktela via Daktela-initiated events):**
 
@@ -111,8 +112,18 @@ For a typical CRM integration, create these automations:
 | Call sync | `call_close` | Sync completed calls to CRM |
 | Email sync | `email_create` | Sync emails to CRM |
 | Chat sync | `web_close` | Sync completed chats to CRM |
-| Contact changed | `contact_update` | Notify CRM of Daktela contact changes |
-| Account changed | `account_update` | Notify CRM of Daktela account changes |
+
+**Do not point `contact_update` / `account_update` automations at
+`WebhookHandler`.** Contacts and accounts flow CRM → Daktela, and the handler's
+`contact`/`account` arms call `syncContact($id)` / `syncAccount($id)`, which look
+`$id` up **in the CRM**. A Daktela automation sends the *Daktela* record name — so
+under the import naming convention the handler asks the CRM for
+`pipedrive_person_123`, finds nothing, and reports `Skipped` on every event.
+
+Those arms exist for the opposite direction: a **CRM-side** webhook telling
+Daktela that a CRM record changed, where the id genuinely is a CRM id. Wiring
+that up is host glue, since every CRM's webhook payload differs — see
+[Production Deployment](09-production-deployment.md) for the shape.
 
 ---
 
@@ -122,8 +133,8 @@ The `WebhookPayloadParser` maps Daktela event name prefixes to entity types:
 
 | Event Prefix | Entity Type | Activity Type | Example Events |
 |-------------|-------------|---------------|----------------|
-| `contact` | contact | — | `contact_create`, `contact_update`, `contact_delete` |
-| `account` | account | — | `account_create`, `account_update`, `account_delete` |
+| `contact` | contact | — | `contact_create`, `contact_update`, `contact_delete` — but see the warning above: the id must be a **CRM** id, so these are for CRM-side webhooks, not Daktela automations |
+| `account` | account | — | `account_create`, `account_update`, `account_delete` — same caveat |
 | `call` | activity | Call | `call_create`, `call_answer`, `call_close` |
 | `email` | activity | Email | `email_create`, `email_close` |
 | `web` | activity | Chat | `web_create`, `web_close` |
@@ -131,6 +142,7 @@ The `WebhookPayloadParser` maps Daktela event name prefixes to entity types:
 | `fbm` | activity | Messenger | `fbm_create`, `fbm_close` |
 | `wap` | activity | WhatsApp | `wap_create`, `wap_close` |
 | `vbr` | activity | Viber | `vbr_create`, `vbr_close` |
+| `igdm` | activity | InstagramDm | `igdm_create`, `igdm_close` |
 
 The parser extracts the prefix before the first `_` to determine the entity type.
 
