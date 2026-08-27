@@ -9,6 +9,12 @@ use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Entity\Contact;
 
+/**
+ * The Daktela (Contact Centre) side of a sync. Implement it to run the SDK
+ * against something other than the shipped {@see Daktela\DaktelaAdapter}.
+ * Methods are only ever ADDED here in a major release; newer needs go into
+ * opt-in capability interfaces alongside it.
+ */
 interface ContactCentreAdapterInterface
 {
     // Contacts (writable — CRM is source-of-truth, CC receives data)
