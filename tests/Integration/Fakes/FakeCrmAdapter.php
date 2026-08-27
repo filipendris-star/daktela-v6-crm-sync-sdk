@@ -13,7 +13,7 @@ use Daktela\CrmSync\Entity\Contact;
  * In-memory CrmAdapter for integration tests. Stores preloaded contacts/accounts
  * and records iterator invocations so tests can assert incremental-sync filtering.
  */
-final class FakeCrmAdapter implements CrmAdapterInterface
+class FakeCrmAdapter implements CrmAdapterInterface
 {
     /** @var Contact[] */
     private array $contacts = [];

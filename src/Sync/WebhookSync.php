@@ -6,6 +6,7 @@ namespace Daktela\CrmSync\Sync;
 
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
+use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
 use Daktela\CrmSync\Config\SyncConfiguration;
@@ -14,6 +15,8 @@ use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
 use Daktela\CrmSync\Entity\Contact;
 use Daktela\CrmSync\Entity\EntityInterface;
+use Daktela\CrmSync\Exception\ConfigurationException;
+use Daktela\CrmSync\Exception\MappingException;
 use Daktela\CrmSync\Mapping\FieldMapper;
 use Daktela\CrmSync\Mapping\MappingCollection;
 use Daktela\CrmSync\Mapping\NestedValue;
@@ -55,7 +58,7 @@ final class WebhookSync
             $mapped = $this->fieldMapper->map($contact, $mapping, SyncDirection::CrmToCc, $relationMaps);
             $upsertResult = $this->ccAdapter->upsertContact($mapping->lookupField, Contact::fromArray($mapped));
 
-            $status = $upsertResult->skipped ? SyncStatus::Skipped : SyncStatus::Updated;
+            $status = $this->statusFor($upsertResult);
             $result->addRecord(new RecordResult('contact', $id, $upsertResult->entity->getId(), $status));
         } catch (\Throwable $e) {
             $this->logger->error('Webhook sync failed for contact {id}: {error}', [
@@ -87,10 +90,15 @@ final class WebhookSync
                 return $result;
             }
 
-            $mapped = $this->fieldMapper->map($account, $mapping, SyncDirection::CrmToCc);
+            // Relations resolved here too. syncContact() has always done this;
+            // omitting it meant an account mapping carrying a `relation:` block
+            // got the raw CRM foreign key written into Daktela on this path and
+            // the resolved value on the batch path.
+            $relationMaps = $this->buildRelationMapsForEntity($account, $mapping);
+            $mapped = $this->fieldMapper->map($account, $mapping, SyncDirection::CrmToCc, $relationMaps);
             $upsertResult = $this->ccAdapter->upsertAccount($mapping->lookupField, Account::fromArray($mapped));
 
-            $status = $upsertResult->skipped ? SyncStatus::Skipped : SyncStatus::Updated;
+            $status = $this->statusFor($upsertResult);
             $result->addRecord(new RecordResult('account', $id, $upsertResult->entity->getId(), $status));
 
             $accountCcId = $upsertResult->entity->getId();
@@ -131,16 +139,65 @@ final class WebhookSync
                 return $result;
             }
 
-            $mapped = $this->fieldMapper->map($activity, $mapping, SyncDirection::CcToCrm);
+            // Per-activity-type rules must apply here exactly as on the batch
+            // path: the two paths write the same CRM records, so mapping them
+            // differently would leave inconsistent data behind depending on
+            // which path happened to carry the activity.
+            $typeMapping = $mapping->forType($type->value);
+
+            $mapped = $this->fieldMapper->map($activity, $typeMapping, SyncDirection::CcToCrm);
+            if ($mapped === []) {
+                throw MappingException::emptyRuleSet('activity', $type->value);
+            }
+
+            // The one place this is knowable: does THIS record carry a value at
+            // the mapping's lookup_field? Without it upsertActivity() has nothing
+            // to look up and creates on every run — silently, since "found
+            // nothing then created" and "created" look identical downstream.
+            //
+            // Reported as a Failed record rather than rethrown: this path handles one
+            // event and keeps no watermark, so there is nothing to protect by aborting,
+            // and the caller needs the failure in the HTTP response. The batch path
+            // rethrows instead, because there a partial failure moves the window.
+            //
+            // A config-load check was tried and removed: it could only see that
+            // some rule targets the field, not that the rule fired for this
+            // record, and it grew a hole for every way of getting that wrong
+            // (a lookup_field naming a cc_field, one written only under a
+            // `types:` block that did not apply here, a dotted path
+            // Activity::get() cannot resolve, a static or append rule, a mapping
+            // built in code and never loaded from YAML).
+            $lookupValue = $mapped[$typeMapping->lookupField] ?? null;
+            if ($lookupValue === null || $lookupValue === '' || is_array($lookupValue)) {
+                throw ConfigurationException::activityExportCannotDedupe($typeMapping->lookupField, array_keys($mapped));
+            }
+
             $mappedActivity = Activity::fromArray($mapped);
 
             if ($activity->getActivityType() !== null) {
                 $mappedActivity->setActivityType($activity->getActivityType());
             }
 
-            $synced = $this->crmAdapter->upsertActivity($mapping->lookupField, $mappedActivity);
+            $linkDeal = $this->config->getEntityConfig('activity')?->linkDeal;
+            if ($linkDeal !== null && $this->crmAdapter instanceof SupportsDealLinkingInterface) {
+                $mappedActivity = $this->crmAdapter->linkActivityToDeal($mappedActivity, $linkDeal);
+            }
 
-            $result->addRecord(new RecordResult('activity', $id, $synced->getId(), SyncStatus::Updated));
+            // One activity emits several events (call_create → call_answer →
+            // call_close); every event after the first must UPDATE the record the
+            // first one created. That decision belongs to the adapter's upsert,
+            // which is the only thing that can actually look in the CRM.
+            $synced = $this->crmAdapter->upsertActivity($typeMapping->lookupField, $mappedActivity);
+
+            // An empty id is the same fact as no id; report it the same way.
+            $crmId = $synced->getId();
+            $crmId = $crmId === '' ? null : $crmId;
+
+            // Updated, meaning "the CRM now matches". upsert does not report which
+            // branch it took, and nothing else here knows either, so this is the
+            // one verdict that is never wrong. The batch path reports the same.
+            $status = SyncStatus::Updated;
+            $result->addRecord(new RecordResult('activity', $id, $crmId, $status));
         } catch (\Throwable $e) {
             $this->logger->error('Webhook sync failed for activity {id}: {error}', [
                 'id' => $id,
@@ -288,6 +345,19 @@ final class WebhookSync
     }
 
     /**
+     * Same three-way verdict the batch path reports (BatchSync::syncEntityToCc):
+     * hardcoding Updated meant a webhook-driven first export reported created=0.
+     */
+    private function statusFor(UpsertResult $upsertResult): SyncStatus
+    {
+        if ($upsertResult->skipped) {
+            return SyncStatus::Skipped;
+        }
+
+        return $upsertResult->created ? SyncStatus::Created : SyncStatus::Updated;
+    }
+
+    /**
      * Builds a targeted relation map for a single entity by looking up only
      * the specific related entities it references (e.g., its account).
      *
@@ -314,25 +384,39 @@ final class WebhookSync
                 continue;
             }
 
-            $resolveToSourceField = null;
+            $identityRule = null;
             foreach ($relatedMapping->mappings as $fm) {
                 if ($fm->ccField === $relation->resolveTo) {
-                    $resolveToSourceField = $fm->crmField;
+                    $identityRule = $fm;
                     break;
                 }
             }
 
-            if ($resolveToSourceField === null) {
+            if ($identityRule === null) {
                 continue;
             }
 
             $relatedEntity = $this->findRelatedEntity($relation->entity, $relation->resolveFrom, (string) $crmValue);
             if ($relatedEntity === null) {
+                // Genuinely absent in the CRM is the documented pass-through
+                // (find* returns null only for absence; a lookup that could not
+                // run throws, and that throw fails the record here).
                 continue;
             }
 
-            $toValue = $relatedEntity->get($resolveToSourceField);
-            if ($toValue !== null) {
+            // The mapped value, not the raw CRM field: this map feeds the same
+            // FieldMapper lookup the batch path feeds, and that one stores the
+            // CC identity produced by the entity's own rule. Reading the field
+            // raw disagreed with it under any transformer on that rule.
+            $toValue = NestedValue::get(
+                $this->fieldMapper->map(
+                    $relatedEntity,
+                    new MappingCollection($relatedMapping->entityType, $relatedMapping->lookupField, [$identityRule]),
+                    SyncDirection::CrmToCc,
+                ),
+                $relation->resolveTo,
+            );
+            if ($toValue !== null && (string) $toValue !== '') {
                 $relationMaps[$relation->entity] ??= [];
                 $relationMaps[$relation->entity][(string) $crmValue] = (string) $toValue;
             }

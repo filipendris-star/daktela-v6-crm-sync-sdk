@@ -1,0 +1,16 @@
+daktela:
+  instance_url: "https://test.daktela.com"
+  access_token: "test-token"
+  database: "test-db"
+
+sync:
+  batch_size: 50
+  entities:
+    activity:
+      enabled: true
+      direction: cc_to_crm
+      mapping_file: "../mappings/activities.yaml"
+      activity_types: [call]
+
+webhook:
+  secret: "test-secret"

@@ -16,7 +16,7 @@ use Daktela\CrmSync\Entity\Contact;
  * contacts/accounts keyed by lookup field, and can be configured to throw
  * for specific lookup values to simulate API failures.
  */
-final class FakeCcAdapter implements ContactCentreAdapterInterface
+class FakeCcAdapter implements ContactCentreAdapterInterface
 {
     /** @var array<string, Contact> */
     public array $contacts = [];

@@ -8,6 +8,7 @@ use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\Daktela\DaktelaAdapter;
 use Daktela\CrmSync\Config\YamlConfigLoader;
+use Daktela\CrmSync\Exception\ConfigurationException;
 use Daktela\CrmSync\Logging\StderrLogger;
 use Daktela\CrmSync\Mapping\Transformer\TransformerRegistry;
 use Daktela\CrmSync\State\FileSyncStateStore;
@@ -43,6 +44,23 @@ final class SyncEngineFactory
         $ccAdapter = new DaktelaAdapter($syncConfig->instanceUrl, $syncConfig->accessToken, $syncConfig->database, $logger);
 
         $registry = TransformerRegistry::withDefaults();
+
+        // No invented default. Deriving one from $configPath put mutable runtime
+        // state in the config directory: often a read-only mount, usually
+        // deploy-scoped (so a redeploy silently reseeds the watermark and skips
+        // everything that closed in the gap), and CWD-relative for the relative
+        // paths every example passes. Instead, say what is missing — the engine
+        // would refuse this config anyway, and here the message can name the
+        // parameter to set.
+        $activityConfig = $syncConfig->getEntityConfig('activity');
+        if ($stateStorePath === null
+            && $activityConfig !== null
+            && $activityConfig->enabled
+            && $activityConfig->initialSync === 'now'
+        ) {
+            throw ConfigurationException::factoryNeedsAStateStorePath();
+        }
+
         $stateStore = $stateStorePath !== null ? new FileSyncStateStore($stateStorePath) : null;
 
         $engine = new SyncEngine($ccAdapter, $crmAdapter, $syncConfig, $logger, $registry, $stateStore);

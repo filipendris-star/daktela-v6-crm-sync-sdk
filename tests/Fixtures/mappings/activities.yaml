@@ -1,5 +1,5 @@
 entity: activity
-lookup_field: name
+lookup_field: external_id
 mappings:
   - cc_field: name
     crm_field: external_id
