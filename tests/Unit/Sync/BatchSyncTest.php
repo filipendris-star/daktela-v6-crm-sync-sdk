@@ -852,7 +852,7 @@ final class BatchSyncTest extends TestCase
             new FieldMapping('email', 'email'),
         ]);
 
-        $activityMapping = new MappingCollection('activity', 'name', [
+        $activityMapping = new MappingCollection('activity', 'external_id', [
             new FieldMapping('name', 'external_id'),
             new FieldMapping('title', 'subject'),
         ]);
@@ -890,7 +890,7 @@ final class BatchSyncTest extends TestCase
             new FieldMapping('name', 'external_id'),
         ]);
 
-        $activityMapping = new MappingCollection('activity', 'name', [
+        $activityMapping = new MappingCollection('activity', 'external_id', [
             new FieldMapping('name', 'external_id'),
             new FieldMapping('title', 'subject'),
         ]);

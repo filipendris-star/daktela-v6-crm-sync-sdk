@@ -40,6 +40,7 @@ final class TransformerRegistry
         $registry->register(new WrapArrayTransformer());
         $registry->register(new UrlTransformer());
         $registry->register(new JoinTransformer());
+        $registry->register(new ValueMapTransformer());
 
         /** @var CallbackTransformer $callback */
         $callback = $registry->get('callback');

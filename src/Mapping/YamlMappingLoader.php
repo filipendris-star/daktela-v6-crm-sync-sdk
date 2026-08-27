@@ -35,27 +35,106 @@ final class YamlMappingLoader
             throw ConfigurationException::invalidMappingFile($filePath, 'Missing or invalid "lookup_field" key');
         }
 
-        if (!isset($data['mappings']) || !is_array($data['mappings'])) {
+        // An empty top-level `mappings` ({} / []) is treated as absent — the UI emits
+        // an empty `mappings:` key alongside default/types, which must not conflict.
+        $hasLegacy = !empty($data['mappings']);
+        $hasStructured = !empty($data['default']) || !empty($data['types']);
+
+        if ($hasLegacy && $hasStructured) {
+            throw ConfigurationException::invalidMappingFile(
+                $filePath,
+                'Use either top-level "mappings" or "default"/"types", not both',
+            );
+        }
+
+        if (!$hasLegacy && !$hasStructured) {
             throw ConfigurationException::invalidMappingFile($filePath, 'Missing or invalid "mappings" key');
         }
 
-        $mappings = [];
-        foreach ($data['mappings'] as $index => $item) {
-            if (!is_array($item)) {
-                throw ConfigurationException::invalidMappingFile(
-                    $filePath,
-                    sprintf('Mapping at index %d must be an array', $index),
-                );
+        if ($hasLegacy) {
+            $base = $this->parseMappingList($filePath, $data['mappings'], 'mappings');
+            $typeMappings = [];
+        } else {
+            $base = [];
+            // Same tolerance as the top-level checks: an empty `default:` ({} / [])
+            // emitted by the UI is treated as absent, not as a malformed section.
+            if (!empty($data['default'])) {
+                if (!is_array($data['default']) || !is_array($data['default']['mappings'] ?? null)) {
+                    throw ConfigurationException::invalidMappingFile(
+                        $filePath,
+                        '"default" must contain a "mappings" list',
+                    );
+                }
+                $base = $this->parseMappingList($filePath, $data['default']['mappings'], 'default.mappings');
             }
 
-            $mappings[] = $this->parseFieldMapping($filePath, $index, $item);
+            $typeMappings = [];
+            if (!empty($data['types'])) {
+                if (!is_array($data['types'])) {
+                    throw ConfigurationException::invalidMappingFile($filePath, '"types" must be a map of type => rules');
+                }
+                foreach ($data['types'] as $typeKey => $typeNode) {
+                    if (!is_array($typeNode) || !is_array($typeNode['mappings'] ?? null)) {
+                        throw ConfigurationException::invalidMappingFile(
+                            $filePath,
+                            sprintf('"types.%s" must contain a "mappings" list', (string) $typeKey),
+                        );
+                    }
+                    $typeMappings[(string) $typeKey] = $this->parseMappingList(
+                        $filePath,
+                        $typeNode['mappings'],
+                        sprintf('types.%s.mappings', (string) $typeKey),
+                    );
+                }
+            }
         }
 
         return new MappingCollection(
             entityType: $data['entity'],
             lookupField: $data['lookup_field'],
-            mappings: $mappings,
+            mappings: $base,
+            typeMappings: $typeMappings,
         );
+    }
+
+    /**
+     * Parse a list of field mapping rules that lives outside a mapping file.
+     *
+     * @param string $origin used in error messages (config path or description)
+     * @param mixed $list
+     * @return FieldMapping[]
+     */
+    public function parseInlineRules(string $origin, mixed $list, string $context = 'rules'): array
+    {
+        return $this->parseMappingList($origin, $list, $context);
+    }
+
+    /**
+     * @param mixed $list
+     * @return FieldMapping[]
+     */
+    private function parseMappingList(string $filePath, mixed $list, string $context): array
+    {
+        if (!is_array($list)) {
+            throw ConfigurationException::invalidMappingFile(
+                $filePath,
+                sprintf('"%s" must be a list', $context),
+            );
+        }
+
+        $mappings = [];
+        foreach ($list as $index => $item) {
+            if (!is_array($item)) {
+                throw ConfigurationException::invalidMappingFile(
+                    $filePath,
+                    sprintf('Mapping at %s[%d] must be an array', $context, $index),
+                );
+            }
+
+            $mappings[] = $this->parseFieldMapping($filePath, (int) $index, $item);
+        }
+
+        return $mappings;
     }
 
     /**
@@ -89,9 +168,47 @@ final class YamlMappingLoader
                         sprintf('Mapping at index %d: invalid transformer definition', $index),
                     );
                 }
+                $params = is_array($t['params'] ?? null) ? $t['params'] : [];
+
+                // Timezone names are validated HERE, not at transform time. An
+                // unknown name makes DateTimeZone throw, and because
+                // DateFormatTransformer returns early for an empty value, that
+                // Error would fail only the records that actually carry a date —
+                // a PARTIAL batch failure, which advances the watermark past the
+                // very records it dropped. One typo, permanent silent loss. Same
+                // rule the rest of the config follows: reject at load.
+                foreach (['from_tz', 'to_tz'] as $tzKey) {
+                    if (!isset($params[$tzKey])) {
+                        continue;
+                    }
+                    // Cast inside the guarded region: a non-scalar value (`to_tz: [a, b]`)
+                    // raises "Array to string conversion", which a host that promotes
+                    // warnings to ErrorException would surface instead of the
+                    // ConfigurationException the rest of this loader guarantees.
+                    if (!is_string($params[$tzKey]) && !is_numeric($params[$tzKey])) {
+                        throw ConfigurationException::invalidMappingFile(
+                            $filePath,
+                            sprintf('Mapping at index %d: "%s" must be a timezone name', $index, $tzKey),
+                        );
+                    }
+                    $tz = (string) $params[$tzKey];
+                    // Ask DateTimeZone, do not compare against listIdentifiers():
+                    // that lists only canonical IANA names, while the constructor
+                    // also accepts abbreviations and offsets (CET, GMT, +02:00).
+                    // Matching the list would reject configs that work today.
+                    try {
+                        new \DateTimeZone($tz);
+                    } catch (\Throwable) {
+                        throw ConfigurationException::invalidMappingFile(
+                            $filePath,
+                            sprintf('Mapping at index %d: unknown timezone "%s" for "%s"', $index, $tz, $tzKey),
+                        );
+                    }
+                }
+
                 $transformers[] = [
                     'name' => (string) $t['name'],
-                    'params' => is_array($t['params'] ?? null) ? $t['params'] : [],
+                    'params' => $params,
                 ];
             }
         }

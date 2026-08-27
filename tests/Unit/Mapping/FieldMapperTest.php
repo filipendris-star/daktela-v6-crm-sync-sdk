@@ -45,7 +45,7 @@ final class FieldMapperTest extends TestCase
 
     public function testCcToCrmMapping(): void
     {
-        $collection = new MappingCollection('activity', 'name', [
+        $collection = new MappingCollection('activity', 'external_id', [
             new FieldMapping('name', 'external_id'),
             new FieldMapping('title', 'subject'),
         ]);
@@ -144,6 +144,55 @@ final class FieldMapperTest extends TestCase
         self::assertSame('acme', $result['account']);
     }
 
+    public function testRelationResolutionForIntegerForeignKey(): void
+    {
+        // Numeric-id CRMs (Pipedrive, HubSpot, …) hand back integer foreign keys;
+        // the resolver must still consult the relation map (whose keys are strings)
+        // rather than writing the raw int. Regression guard for the is_string()
+        // short-circuit that broke Pipedrive contact→account links.
+        $collection = new MappingCollection('contact', 'email', [
+            new FieldMapping(
+                ccField: 'account',
+                crmField: 'org_id',
+                relation: new RelationConfig('account', 'id', 'name'),
+            ),
+        ]);
+
+        $entity = Contact::fromArray(['org_id' => 6]);
+
+        $relationMaps = [
+            'account' => ['6' => 'pipedrive_6'],
+        ];
+
+        $result = $this->mapper->map($entity, $collection, SyncDirection::CrmToCc, $relationMaps);
+
+        self::assertSame('pipedrive_6', $result['account']);
+    }
+
+    public function testUnresolvedIntegerForeignKeyKeepsItsIntegerType(): void
+    {
+        // The pass-through on a miss must return the ORIGINAL value, not a
+        // stringified copy: widening the resolver to accept int FKs otherwise
+        // turns an unresolved 4712 into "4712", which strictly-typed CRM number
+        // fields reject with a 400.
+        $collection = new MappingCollection('contact', 'email', [
+            new FieldMapping(
+                ccField: 'account',
+                crmField: 'org_id',
+                relation: new RelationConfig('account', 'id', 'name'),
+            ),
+        ]);
+
+        $result = $this->mapper->map(
+            Contact::fromArray(['org_id' => 4712]),
+            $collection,
+            SyncDirection::CrmToCc,
+            ['account' => ['99' => 'known']],
+        );
+
+        self::assertSame(4712, $result['account']);
+    }
+
     public function testRelationResolutionFallsBackToOriginalValue(): void
     {
         $collection = new MappingCollection('contact', 'email', [
@@ -202,7 +251,7 @@ final class FieldMapperTest extends TestCase
 
     public function testMultiValueJoinApplied(): void
     {
-        $collection = new MappingCollection('activity', 'name', [
+        $collection = new MappingCollection('activity', 'external_id', [
             new FieldMapping(
                 ccField: 'customFields.interests',
                 crmField: 'interests',
