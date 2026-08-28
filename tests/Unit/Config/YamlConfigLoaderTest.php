@@ -39,14 +39,100 @@ final class YamlConfigLoaderTest extends TestCase
     }
 
     #[\PHPUnit\Framework\Attributes\DataProvider('rejectedConfigProvider')]
-    public function testAnUnusableEntityConfigIsRejectedRatherThanSilentlyEmptied(string $entityBlock, string $expected): void
+    public function testAnUnusableEntityConfigFaultsThatEntityWithoutFailingTheLoad(string $entityBlock, string $expected): void
     {
+        // Faulted, not thrown. The fault is confined to this entity, so aborting the
+        // load would take contacts and accounts down with it — the outcome
+        // SyncEngine::runIsolated() exists to prevent for the same fault at run time.
+        // The entity is left disabled so it cannot run half-configured, and the reason
+        // is carried on the config for SyncEngine to report.
         $path = $this->writeConfig("sync:\n  batch_size: 10\n  entities:\n    {$entityBlock}\n");
 
         try {
-            $this->expectException(ConfigurationException::class);
-            $this->expectExceptionMessageMatches('/' . preg_quote($expected, '/') . '/');
-            $this->loader->load($path);
+            $config = $this->loader->load($path);
+
+            self::assertArrayHasKey('activity', $config->getEntityFaults());
+            self::assertMatchesRegularExpression(
+                '/' . preg_quote($expected, '/') . '/',
+                $config->getEntityFaults()['activity'],
+            );
+            self::assertFalse($config->isEntityEnabled('activity'), 'a faulted entity must not run');
+        } finally {
+            $this->cleanUp($path);
+        }
+    }
+
+    public function testAFaultedEntityDoesNotDisableTheOthers(): void
+    {
+        // The whole point of faulting rather than throwing: a typo in the activity
+        // block must not stop contacts syncing.
+        $path = $this->writeConfig(
+            "sync:\n  batch_size: 10\n  entities:\n"
+            . "    contact:\n      enabled: true\n      direction: crm_to_cc\n"
+            . "    activity:\n      enabled: true\n      direction: cc_to_crm\n      activity_types: [CALL]\n",
+        );
+
+        try {
+            $config = $this->loader->load($path);
+
+            self::assertTrue($config->isEntityEnabled('contact'), 'contact must survive the activity fault');
+            self::assertFalse($config->isEntityEnabled('activity'));
+            self::assertSame(['activity'], array_keys($config->getEntityFaults()));
+        } finally {
+            $this->cleanUp($path);
+        }
+    }
+
+    public function testACleanConfigCarriesNoFaults(): void
+    {
+        $path = $this->writeConfig(
+            "sync:\n  batch_size: 10\n  entities:\n"
+            . "    activity:\n      enabled: true\n      direction: cc_to_crm\n      activity_types: [call]\n",
+        );
+
+        try {
+            self::assertSame([], $this->loader->load($path)->getEntityFaults());
+        } finally {
+            $this->cleanUp($path);
+        }
+    }
+
+    public function testAnInvalidInitialSyncFaultsTheEntity(): void
+    {
+        $path = $this->writeConfig(
+            "sync:\n  batch_size: 10\n  entities:\n"
+            . "    activity:\n      enabled: true\n      direction: cc_to_crm\n"
+            . "      activity_types: [call]\n      initial_sync: yesterday\n",
+        );
+
+        try {
+            $config = $this->loader->load($path);
+
+            self::assertMatchesRegularExpression(
+                '/initial_sync must be "now" or "everything"/',
+                $config->getEntityFaults()['activity'] ?? '',
+            );
+            self::assertFalse($config->isEntityEnabled('activity'));
+        } finally {
+            $this->cleanUp($path);
+        }
+    }
+
+    public function testAnUnknownActivityTypeMapKeyFaultsTheEntity(): void
+    {
+        $path = $this->writeConfig(
+            "sync:\n  batch_size: 10\n  entities:\n"
+            . "    activity:\n      enabled: true\n      direction: cc_to_crm\n"
+            . "      activity_types: [call]\n      activity_type_map:\n        nosuchtype: Call\n",
+        );
+
+        try {
+            $config = $this->loader->load($path);
+
+            self::assertMatchesRegularExpression(
+                '/activity_type_map: unknown CC activity type "nosuchtype"/',
+                $config->getEntityFaults()['activity'] ?? '',
+            );
         } finally {
             $this->cleanUp($path);
         }
@@ -67,14 +153,18 @@ final class YamlConfigLoaderTest extends TestCase
         // So an absent or empty list made it iterate nothing, report an exhausted
         // 0-record success and advance the watermark on every run: the export
         // silently never happened and only forceFullSync recovered it. Unknown
-        // values were already rejected for exactly this reason; emptiness is the
+        // values were already faulted for exactly this reason; emptiness is the
         // same failure with the same cause.
         $path = $this->writeConfig("sync:\n  batch_size: 10\n  entities:\n    {$entityBlock}\n");
 
         try {
-            $this->expectException(ConfigurationException::class);
-            $this->expectExceptionMessageMatches('/activity_types is required/');
-            $this->loader->load($path);
+            $config = $this->loader->load($path);
+
+            self::assertMatchesRegularExpression(
+                '/activity_types is required/',
+                $config->getEntityFaults()['activity'] ?? '',
+            );
+            self::assertFalse($config->isEntityEnabled('activity'));
         } finally {
             $this->cleanUp($path);
         }
@@ -126,6 +216,59 @@ final class YamlConfigLoaderTest extends TestCase
             $this->expectException(ConfigurationException::class);
             $this->expectExceptionMessageMatches('/duplicate name "deals"/');
             $this->loader->load($path);
+        } finally {
+            $this->cleanUp($path);
+        }
+    }
+
+    // ── initial_sync: absent is not "now" (1.2.0) ───────────────────────────
+
+    /**
+     * `initial_sync` is new in 1.2.0. Every config written against an earlier
+     * release omits it, and "now" carries a hard state-store requirement — so
+     * defaulting an absent key to "now" would take working deployments down on a
+     * minor upgrade to enforce a preference they never expressed.
+     */
+    public function testAnAbsentInitialSyncStaysNullRatherThanDefaultingToNow(): void
+    {
+        $path = $this->writeConfig(
+            "sync:\n  batch_size: 10\n  entities:\n"
+            . "    activity:\n      enabled: true\n      direction: cc_to_crm\n      activity_types: [call]\n",
+        );
+
+        try {
+            $activity = $this->loader->load($path)->getEntityConfig('activity');
+
+            self::assertNotNull($activity);
+            self::assertNull($activity->initialSync, 'absent must not read as "now"');
+            self::assertSame('everything', $activity->effectiveInitialSync(), 'pre-1.2.0 behaviour');
+        } finally {
+            $this->cleanUp($path);
+        }
+    }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function explicitInitialSyncProvider(): iterable
+    {
+        yield 'now' => ['now', 'now'];
+        yield 'everything' => ['everything', 'everything'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('explicitInitialSyncProvider')]
+    public function testAnExplicitInitialSyncIsPreserved(string $written, string $expected): void
+    {
+        $path = $this->writeConfig(
+            "sync:\n  batch_size: 10\n  entities:\n"
+            . "    activity:\n      enabled: true\n      direction: cc_to_crm\n"
+            . "      activity_types: [call]\n      initial_sync: {$written}\n",
+        );
+
+        try {
+            $activity = $this->loader->load($path)->getEntityConfig('activity');
+
+            self::assertNotNull($activity);
+            self::assertSame($expected, $activity->initialSync);
+            self::assertSame($expected, $activity->effectiveInitialSync());
         } finally {
             $this->cleanUp($path);
         }
@@ -201,6 +344,10 @@ final class YamlConfigLoaderTest extends TestCase
         // custom entity slot syncs one way and there is no handler: the entry fell
         // into the IMPORT branch and died with "Unsupported entity type: persons",
         // naming the CRM resource instead of the real problem.
+        //
+        // Faulted, not thrown: before 1.2.0 the direction was parsed and ignored, so
+        // such an entry loaded and ran as an import. Failing the load would take the
+        // whole sync down on upgrade for one bad entry.
         $dir = sys_get_temp_dir() . '/crmsync_cfg_' . bin2hex((string) getmypid());
         @mkdir($dir, 0777, true);
         $path = $dir . '/sync.yaml';
@@ -217,13 +364,16 @@ final class YamlConfigLoaderTest extends TestCase
                   direction: bidirectional
                   source: contact
                   target: persons
-                  mapping_file: mappings/contacts.yaml
             YAML);
 
         try {
-            $this->expectException(ConfigurationException::class);
-            $this->expectExceptionMessageMatches('/only "crm_to_cc" is supported/');
-            $this->loader->load($path);
+            $config = $this->loader->load($path);
+
+            self::assertMatchesRegularExpression(
+                '/only "crm_to_cc" is implemented/',
+                $config->getEntityFaults()['custom:contact_export'] ?? '',
+            );
+            self::assertSame([], $config->getEnabledCustomEntities(), 'the entry must be disabled');
         } finally {
             @unlink($path);
             @rmdir($dir);

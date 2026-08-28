@@ -34,11 +34,10 @@ final class WebhookPayloadParser
         // prefix as the entity type — `contact` and `account` route on their own
         // names, anything unknown reaches WebhookHandler's warning arm.
         //
-        // There used to be a second map listing the activity prefixes as well,
-        // and adding `igdm` to only one of them made Instagram DM webhooks
-        // resolve to entityType "igdm", which route() dropped: HTTP 200, zero
-        // records, no retry. What is left of that map was an identity lookup
-        // behind this same `??`, so it is gone.
+        // Keep it ONE map. A second list of activity prefixes has to be updated in
+        // lockstep, and a type added to only one of them resolves to its own
+        // prefix as the entity type — which route() drops as unknown: HTTP 200,
+        // zero records, no retry.
         $activityType = self::EVENT_ACTIVITY_TYPE_MAP[$eventPrefix] ?? null;
         $entityType = $activityType !== null ? 'activity' : $eventPrefix;
 

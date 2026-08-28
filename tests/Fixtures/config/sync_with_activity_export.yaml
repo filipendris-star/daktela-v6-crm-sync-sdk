@@ -11,6 +11,8 @@ sync:
       direction: cc_to_crm
       mapping_file: "../mappings/activities.yaml"
       activity_types: [call]
+      # Explicit: the state-store requirement keys off an EXPLICIT "now".
+      initial_sync: now
 
 webhook:
   secret: "test-secret"

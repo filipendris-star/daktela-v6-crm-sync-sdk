@@ -16,6 +16,10 @@
         <testsuite name="E2E">
             <directory>tests/E2E</directory>
         </testsuite>
+        <!-- Upgrade safety: a v1.1.0 deployment must still run on this release. -->
+        <testsuite name="Regression">
+            <directory>tests/Regression</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>

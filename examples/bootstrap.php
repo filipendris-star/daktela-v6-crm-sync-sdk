@@ -53,9 +53,9 @@ if ($crmAdapter === null) {
 }
 
 // --- Create the sync engine ---
-// A state store is REQUIRED when the activity export uses the default
-// `initial_sync: now`: without a watermark to seed, every run would push the
-// full contact-centre history to the CRM, not just the first.
+// A state store is REQUIRED when the activity export sets `initial_sync: now`
+// (as config/example/sync.yaml does): without a watermark to seed, every run
+// would push the full contact-centre history to the CRM, not just the first.
 $stateStore = new FileSyncStateStore(__DIR__ . '/../var/sync-state.json');
 
 $engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, stateStore: $stateStore);

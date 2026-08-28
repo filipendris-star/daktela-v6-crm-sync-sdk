@@ -258,6 +258,93 @@ final class YamlMappingLoaderTest extends TestCase
         }
     }
 
+    // ── activity lookup_field must name the CRM side (1.2.0) ────────────────
+
+    /**
+     * The SDK's own 1.1.0 example shipped `lookup_field: name` against
+     * `crm_field: external_id`, so every config derived from it names the wrong
+     * side. Left to run time that aborts the activity step on every run with a
+     * message that can only say the value is missing; caught here it can name the
+     * field to use instead.
+     */
+    public function testAnActivityLookupFieldNamingACcFieldIsRejectedWithASuggestion(): void
+    {
+        $file = $this->writeTempMapping(
+            "entity: activity\nlookup_field: name\nmappings:\n"
+            . "  - { cc_field: name, crm_field: external_id }\n"
+            . "  - { cc_field: title, crm_field: subject }\n",
+        );
+
+        try {
+            (new YamlMappingLoader())->load($file);
+            self::fail('expected a ConfigurationException');
+        } catch (ConfigurationException $e) {
+            self::assertStringContainsString('names a cc_field', $e->getMessage());
+            self::assertStringContainsString('Did you mean "external_id"?', $e->getMessage());
+        }
+    }
+
+    public function testAnActivityLookupFieldNamingTheCrmSideLoads(): void
+    {
+        $file = $this->writeTempMapping(
+            "entity: activity\nlookup_field: external_id\nmappings:\n"
+            . "  - { cc_field: name, crm_field: external_id }\n",
+        );
+
+        self::assertSame('external_id', (new YamlMappingLoader())->load($file)->lookupField);
+    }
+
+    public function testTheGuardDoesNotApplyToImportMappings(): void
+    {
+        // On import the upsert looks up the CC-side record, so lookup_field naming
+        // a cc_field is CORRECT. Tripping here would reject every contact mapping.
+        $file = $this->writeTempMapping(
+            "entity: contact\nlookup_field: name\nmappings:\n"
+            . "  - { cc_field: name, crm_field: external_id }\n",
+        );
+
+        self::assertSame('name', (new YamlMappingLoader())->load($file)->lookupField);
+    }
+
+    public function testALookupFieldWrittenOnlyByATypeRuleIsAccepted(): void
+    {
+        // The rule that writes it lives under `types:`, so the payload carries the
+        // key for that type. Not the loader's business to decide whether the type
+        // applies — the write-time check owns that.
+        $file = $this->writeTempMapping(
+            "entity: activity\nlookup_field: external_id\n"
+            . "default:\n  mappings:\n    - { cc_field: title, crm_field: subject }\n"
+            . "types:\n  call:\n    mappings:\n      - { cc_field: name, crm_field: external_id }\n",
+        );
+
+        self::assertSame('external_id', (new YamlMappingLoader())->load($file)->lookupField);
+    }
+
+    public function testALookupFieldMatchingNoRuleAtAllIsLeftToTheWriteTimeCheck(): void
+    {
+        // Nothing here says which side is meant, so the loader stays out of it
+        // rather than guessing — BatchSync refuses the record at write time.
+        $file = $this->writeTempMapping(
+            "entity: activity\nlookup_field: some_other_field\nmappings:\n"
+            . "  - { cc_field: title, crm_field: subject }\n",
+        );
+
+        self::assertSame('some_other_field', (new YamlMappingLoader())->load($file)->lookupField);
+    }
+
+    public function testARuleWritingTheLookupFieldWinsOverACcFieldOfTheSameName(): void
+    {
+        // `name` is both a cc_field on one rule and the crm_field on another. The
+        // payload will carry the key, so this must load.
+        $file = $this->writeTempMapping(
+            "entity: activity\nlookup_field: name\nmappings:\n"
+            . "  - { cc_field: name, crm_field: external_id }\n"
+            . "  - { cc_field: title, crm_field: name }\n",
+        );
+
+        self::assertSame('name', (new YamlMappingLoader())->load($file)->lookupField);
+    }
+
     private function writeTempMapping(string $yaml): string
     {
         $base = tempnam(sys_get_temp_dir(), 'mapping_');

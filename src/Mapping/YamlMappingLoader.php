@@ -89,6 +89,15 @@ final class YamlMappingLoader
             }
         }
 
+        if ($data['entity'] === 'activity') {
+            $this->assertActivityLookupNamesTheCrmSide(
+                $filePath,
+                $data['lookup_field'],
+                $base,
+                $typeMappings,
+            );
+        }
+
         return new MappingCollection(
             entityType: $data['entity'],
             lookupField: $data['lookup_field'],
@@ -98,15 +107,63 @@ final class YamlMappingLoader
     }
 
     /**
-     * Parse a list of field mapping rules that lives outside a mapping file.
+     * Catch the one `lookup_field` mistake a loader CAN see: it names a rule's
+     * cc_field while that rule writes a DIFFERENT crm_field.
      *
-     * @param string $origin used in error messages (config path or description)
-     * @param mixed $list
-     * @return FieldMapping[]
+     * Activities are export-only (cc_to_crm), so `lookup_field` is read against the
+     * mapped CRM payload — it has to name a crm_field. Naming the cc_field is the
+     * natural mistake, and the SDK's own example shipped it until 1.2.0
+     * (`lookup_field: name` against `crm_field: external_id`), so every config
+     * derived from that example carries it.
+     *
+     * Left to run time it surfaces as an aborted activity step on every run, with a
+     * message that can only say the value is missing. Here it can say what to use
+     * instead.
+     *
+     * Deliberately narrow. It fires only when the name is unambiguously the wrong
+     * side of a rule that exists; every other way of getting `lookup_field` wrong (a
+     * dotted path, a static rule, a value that does not vary per record) is invisible
+     * to a loader and stays with the write-time checks in BatchSync/WebhookSync.
+     *
+     * @param FieldMapping[] $base
+     * @param array<string, FieldMapping[]> $typeMappings
      */
-    public function parseInlineRules(string $origin, mixed $list, string $context = 'rules'): array
-    {
-        return $this->parseMappingList($origin, $list, $context);
+    private function assertActivityLookupNamesTheCrmSide(
+        string $filePath,
+        string $lookupField,
+        array $base,
+        array $typeMappings,
+    ): void {
+        $allRules = $base;
+        foreach ($typeMappings as $typeRules) {
+            foreach ($typeRules as $rule) {
+                $allRules[] = $rule;
+            }
+        }
+
+        // A rule that WRITES this name settles it: the payload will carry the key,
+        // wherever else the name also appears.
+        foreach ($allRules as $rule) {
+            if ($rule->crmField === $lookupField) {
+                return;
+            }
+        }
+
+        foreach ($allRules as $rule) {
+            if ($rule->ccField === $lookupField && $rule->crmField !== '') {
+                throw ConfigurationException::invalidMappingFile(
+                    $filePath,
+                    sprintf(
+                        'lookup_field "%s" names a cc_field. An activity mapping exports to the CRM, '
+                        . 'so lookup_field must name the CRM-side field that carries the Daktela '
+                        . 'activity id — otherwise every export re-creates the record instead of '
+                        . 'updating it. Did you mean "%s"?',
+                        $lookupField,
+                        $rule->crmField,
+                    ),
+                );
+            }
+        }
     }
 
     /**

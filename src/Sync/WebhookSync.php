@@ -160,13 +160,9 @@ final class WebhookSync
             // and the caller needs the failure in the HTTP response. The batch path
             // rethrows instead, because there a partial failure moves the window.
             //
-            // A config-load check was tried and removed: it could only see that
-            // some rule targets the field, not that the rule fired for this
-            // record, and it grew a hole for every way of getting that wrong
-            // (a lookup_field naming a cc_field, one written only under a
-            // `types:` block that did not apply here, a dotted path
-            // Activity::get() cannot resolve, a static or append rule, a mapping
-            // built in code and never loaded from YAML).
+            // Checked here and not at config load, for the reason given in
+            // BatchSync::syncActivityToCrm(): a loader sees which rules exist, not
+            // which fired.
             $lookupValue = $mapped[$typeMapping->lookupField] ?? null;
             if ($lookupValue === null || $lookupValue === '' || is_array($lookupValue)) {
                 throw ConfigurationException::activityExportCannotDedupe($typeMapping->lookupField, array_keys($mapped));

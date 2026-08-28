@@ -13,15 +13,17 @@ namespace Daktela\CrmSync\Mapping\Transformer;
  *   default: value to use when the input is not present in the map.
  *            When omitted, unmatched input passes through unchanged.
  *
- * Example — derive Pipedrive activity "done" from a missed-call flag:
+ * Example — translate the activity direction into a CRM's own vocabulary:
  *   transformers:
  *     - name: value_map
- *       params: { map: { in_missed: 0 }, default: 1 }
+ *       params: { map: { in: inbound, out: outbound }, default: internal }
  *
- * Key on the DERIVED `item_call_state` token, not on a raw flag. Daktela's
- * missed-call flag is an integer (1/0/NULL, serialised by the v6 API as "1"/"0"),
- * so a map keyed `"false"` matches only a real PHP false and every activity
- * silently takes the default.
+ * Mind the SOURCE TYPE when writing keys. Daktela's boolean-ish fields are
+ * integers (1/0/NULL, serialised by the v6 API as "1"/"0"), so a map keyed
+ * `"false"` matches only a real PHP false and every record silently takes the
+ * default; key those `"0"` / `"1"`. Direction casing also varies by activity type
+ * — call and email items store 'in'/'out', the chat family stores 'IN'/'OUT' — so
+ * a map that lists only one case sends the rest to the default.
  */
 final class ValueMapTransformer implements ValueTransformerInterface
 {

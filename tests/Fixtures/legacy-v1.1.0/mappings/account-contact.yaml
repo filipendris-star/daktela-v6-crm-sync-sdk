@@ -1,0 +1,18 @@
+entity: contact
+lookup_field: name
+
+mappings:
+  - cc_field: title
+    crm_field: company_name
+
+  - cc_field: name
+    crm_field: external_id
+    transformers:
+      - name: prefix
+        params: { value: "company_" }
+
+  - cc_field: email
+    crm_field: email
+
+  - cc_field: number
+    crm_field: phone

@@ -163,6 +163,17 @@ Two failure levels exist and they need different handling:
   a whole step that failed: an adapter fault, a misconfiguration, or every one of
   its records failing. The step's sync window is deliberately **not** advanced, so
   nothing edited during the outage falls out of the incremental window.
+- **config faults** — an entity whose own configuration is invalid (an unknown
+  `activity_types` value, an unloadable mapping file, an unsupported custom-entity
+  `direction`). The loader leaves that entity **disabled** and records the reason;
+  `SyncEngine` seeds it into `stepFailures` before the run starts, so it surfaces
+  exactly like a step failure and the exit code below covers it.
+
+  A fault in one entity never stops the others. Aborting the config load for it
+  would take contacts, accounts and activities down together — the same outcome
+  step isolation exists to prevent at run time. Only a fault that invalidates the
+  whole file (unparseable YAML, missing credentials, a `batch_size` that breaks
+  every drain) still refuses to load.
 
 `fullSync()` returns normally even when steps failed, so a scheduler must check
 `hasStepFailures()` — otherwise a total outage looks like a successful run:

@@ -28,13 +28,6 @@ sync:
       direction: cc_to_crm
       mapping_file: "mappings/activities.yaml"
       activity_types: [call, email]
-      # First-run behaviour when no watermark exists yet.
-      #   now        — seed the watermark to the current time and push nothing;
-      #                historical activities stay out of the CRM. Requires a state store.
-      #   everything — push the full contact-centre history on the first run.
-      # Omitting the key keeps the pre-1.2.0 behaviour ("everything") and logs a
-      # warning; "now" becomes the default in 2.0, so set it explicitly.
-      initial_sync: now
 
 webhook:
   secret: "${WEBHOOK_SECRET}"

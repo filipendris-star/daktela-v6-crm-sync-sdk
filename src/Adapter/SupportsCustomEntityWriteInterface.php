@@ -5,11 +5,18 @@ declare(strict_types=1);
 namespace Daktela\CrmSync\Adapter;
 
 /**
- * NOT CONSUMED BY THE ENGINE IN THIS RELEASE. The `cc_to_crm` direction of
- * `custom_entities` is not shipped here, so nothing calls these methods. The
- * interface is kept because adapters in daktela-crm-integrations already declare
- * it: removing it would stop them loading, and an adapter that declares a
- * capability the engine does not yet consume is harmless and forward-compatible.
+ * COMPATIBILITY DECLARATION — NOT CONSUMED BY THE ENGINE. The `cc_to_crm`
+ * direction of `custom_entities` is not shipped, and the config loader faults any
+ * enabled entry that declares it, so nothing here is ever called.
+ *
+ * It ships only because adapters in daktela-crm-integrations already declare it;
+ * removing it would stop them loading. That is the sole reason, and it is not a
+ * standing one: this interface must either be consumed by the custom-entity export
+ * feature or deleted together with the adapters' `implements` clauses. Do not build
+ * anything else against it, and do not treat its presence as evidence the feature
+ * exists.
+ *
+ * Removal target: 2.0.
  *
  * Optional capability: write custom entity records into the CRM.
  *

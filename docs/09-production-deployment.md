@@ -41,7 +41,7 @@ A production deployment consists of three runtime components:
 
 ## Incremental Sync Setup
 
-Without a state store, every `fullSync()` call re-syncs all records from scratch. For the activity EXPORT with `initial_sync: now` (the default) this is refused outright, because re-pushing the full contact-centre history on every run is never intended. The `FileSyncStateStore` enables incremental sync by saving the last successful sync timestamp per entity type.
+Without a state store, every `fullSync()` call re-syncs all records from scratch. For the activity EXPORT with an explicit `initial_sync: now` this is refused outright, because re-pushing the full contact-centre history on every run is never intended. The `FileSyncStateStore` enables incremental sync by saving the last successful sync timestamp per entity type.
 
 ### Wiring (using SyncEngineFactory)
 
@@ -347,7 +347,7 @@ $engine->resetState('contact');
 
 **A reset alone does not re-push history for exports.** Clearing a watermark
 makes the next run look like a *first* run, and a first run of a `cc_to_crm`
-entity with `initial_sync: now` (the default — activities; custom-entity export
+entity with `initial_sync: now` (activities; custom-entity export
 is not part of this release and has no seed rail) seeds the watermark back to
 now and pushes nothing. That run reports
 `0 total, 0 failed` and looks clean while the history stays permanently outside

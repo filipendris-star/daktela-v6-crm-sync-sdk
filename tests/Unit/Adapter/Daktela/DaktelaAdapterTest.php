@@ -198,8 +198,84 @@ final class DaktelaAdapterTest extends TestCase
         ];
     }
 
-    #[\PHPUnit\Framework\Attributes\DataProvider('callStateProvider')]
-    public function testFlattenActivityRowDerivesCallState(array $item, ?string $expected): void
+    /**
+     * Flattening exposes what the platform returned, and derives nothing.
+     *
+     * The adapter used to synthesise an `item_call_state` token from
+     * item_direction x item_answered. It was removed in 1.2.0: the token's
+     * vocabulary was chosen to feed one CRM's value_map, and deciding what a
+     * combination of Daktela fields MEANS to a given CRM belongs in that CRM's
+     * adapter, not in the shared platform adapter. These tests pin the boundary so
+     * the derivation cannot quietly return.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('itemFlatteningProvider')]
+    public function testFlattenActivityRowExposesItemFieldsVerbatim(array $item, array $expected): void
+    {
+        $row = $this->flatten(['item' => $item]);
+
+        foreach ($expected as $key => $value) {
+            self::assertArrayHasKey($key, $row);
+            self::assertSame($value, $row[$key], "item field {$key}");
+        }
+    }
+
+    /** @return iterable<string, array{array<string, mixed>, array<string, mixed>}> */
+    public static function itemFlatteningProvider(): iterable
+    {
+        yield 'scalars are prefixed and kept as-is' => [
+            ['direction' => 'out', 'answered' => 1, 'text' => 'hi'],
+            ['item_direction' => 'out', 'item_answered' => 1, 'item_text' => 'hi'],
+        ];
+
+        // The v6 API serialises flags as strings on some endpoints. The adapter must
+        // not coerce them — a consumer keying a value_map needs to see "0", not false.
+        yield 'string flags keep their string type' => [
+            ['direction' => 'out', 'answered' => '0'],
+            ['item_direction' => 'out', 'item_answered' => '0'],
+        ];
+
+        // The chat family (web, fbm, wap, viber) stores direction UPPERCASE
+        // (BaseChatMapper::I_DIRECTION_IN = 'IN') while calls and emails store it
+        // lowercase. The adapter reports both verbatim; folding is the consumer's
+        // job, and docs/03 says so.
+        yield 'uppercase chat direction is not folded' => [
+            ['direction' => 'IN', 'answered' => 1],
+            ['item_direction' => 'IN', 'item_answered' => 1],
+        ];
+
+        yield 'nulls survive' => [
+            ['direction' => 'in', 'answered' => null],
+            ['item_direction' => 'in', 'item_answered' => null],
+        ];
+    }
+
+    public function testFlattenActivityRowDerivesNothing(): void
+    {
+        $row = $this->flatten(['item' => ['direction' => 'in', 'answered' => 0]]);
+
+        self::assertArrayNotHasKey('item_call_state', $row, 'the removed derivation must not return');
+        self::assertSame(
+            ['item', 'item_direction', 'item_answered'],
+            array_keys($row),
+            'flattening adds item_* keys and nothing else',
+        );
+    }
+
+    public function testFlattenActivityRowSkipsNonScalarItemFields(): void
+    {
+        // Only scalars are addressable by a mapping rule; a nested array would
+        // arrive at the CRM as an unusable value.
+        $row = $this->flatten(['item' => ['direction' => 'in', 'tags' => ['a', 'b']]]);
+
+        self::assertArrayHasKey('item_direction', $row);
+        self::assertArrayNotHasKey('item_tags', $row);
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
+    private function flatten(array $row): array
     {
         $adapter = new DaktelaAdapter(
             'https://test.daktela.com',
@@ -208,39 +284,10 @@ final class DaktelaAdapterTest extends TestCase
             new NullLogger(),
         );
 
-        $method = new \ReflectionMethod($adapter, 'flattenActivityRow');
-        $row = $method->invoke($adapter, ['item' => $item]);
+        /** @var array<string, mixed> $flat */
+        $flat = (new \ReflectionMethod($adapter, 'flattenActivityRow'))->invoke($adapter, $row);
 
-        self::assertSame($expected, $row['item_call_state'] ?? null);
-    }
-
-    /** @return iterable<string, array{array<string, mixed>, ?string}> */
-    public static function callStateProvider(): iterable
-    {
-        yield 'outgoing answered' => [['direction' => 'out', 'answered' => 1], 'out_answered'];
-        yield 'outgoing no answer' => [['direction' => 'out', 'answered' => 0], 'out_noanswer'];
-        yield 'incoming answered' => [['direction' => 'in', 'answered' => 1], 'in_answered'];
-        yield 'incoming missed' => [['direction' => 'in', 'answered' => 0], 'in_missed'];
-        yield 'internal answered' => [['direction' => 'internal', 'answered' => 1], 'internal_answered'];
-        yield 'internal no answer' => [['direction' => 'internal', 'answered' => 0], 'internal_noanswer'];
-
-        // The v6 API serialises the flags as strings too — "0" must not read as answered.
-        yield 'string flags' => [['direction' => 'out', 'answered' => '0'], 'out_noanswer'];
-
-        // SMS items carry a direction but no answered flag: no state must be derived,
-        // so per-type sms mappings never see a bogus item_call_state.
-        yield 'sms-like item without answered' => [['direction' => 'in', 'text' => 'hi'], null];
-
-        yield 'item without direction' => [['answered' => 1], null];
-
-        // The chat family (web, fbm, wap, viber) stores the direction UPPERCASE
-        // (BaseChatMapper::I_DIRECTION_IN = 'IN') while calls and emails store it
-        // lowercase. Unfolded, every chat missed both arms and fell into the
-        // internal_* default — a wrong token in derived data, silently.
-        yield 'chat incoming answered (uppercase)' => [['direction' => 'IN', 'answered' => 1], 'in_answered'];
-        yield 'chat incoming unanswered (uppercase)' => [['direction' => 'IN', 'answered' => 0], 'in_missed'];
-        yield 'chat outgoing answered (uppercase)' => [['direction' => 'OUT', 'answered' => 1], 'out_answered'];
-        yield 'mixed case is folded too' => [['direction' => 'Out', 'answered' => 0], 'out_noanswer'];
+        return $flat;
     }
 
     #[\PHPUnit\Framework\Attributes\DataProvider('unusableResponseProvider')]
@@ -427,6 +474,83 @@ final class DaktelaAdapterTest extends TestCase
         self::assertSame(1, $userQueries, 'the login must not be looked up a second time as if it were an email');
         self::assertCount(1, $writes);
         self::assertStringContainsString('sales@daktela.local', $writes[0], 'the resolved owner must survive to the payload');
+    }
+
+    public function testAnUnchangedContactWithAResolvedOwnerIsSkipped(): void
+    {
+        // The reason the owner is resolved BEFORE the comparison: the CC record
+        // stores the login, the mapped record carries the email. Compared as-is,
+        // every contact looks changed and a no-op PUT bumps `edited` forever.
+        $writes = [];
+        $http = $this->createMock(\GuzzleHttp\ClientInterface::class);
+        $http->method('send')->willReturnCallback(
+            function (\Psr\Http\Message\RequestInterface $request) use (&$writes) {
+                $path = strtolower($request->getUri()->getPath());
+
+                if (str_contains($path, 'users')) {
+                    return $this->jsonResponse(['result' => ['data' => [['name' => 'jsmith']], 'total' => 1]]);
+                }
+
+                if ($request->getMethod() !== 'GET') {
+                    $writes[] = (string) $request->getBody();
+
+                    return $this->jsonResponse(['result' => ['name' => 'contact_1']]);
+                }
+
+                return $this->jsonResponse([
+                    'result' => ['data' => [['name' => 'contact_1', 'title' => 'Same', 'user' => 'jsmith']], 'total' => 1],
+                ]);
+            },
+        );
+        ApiCommunicator::getInstance('https://ownerskip.daktela.test', 'test-token')->setHttpClient($http);
+
+        $adapter = new DaktelaAdapter('https://ownerskip.daktela.test', 'test-token', 'test-db', new NullLogger());
+        $result = $adapter->upsertContact(
+            'name',
+            Contact::fromArray(['name' => 'contact_1', 'title' => 'Same', 'user' => 'jsmith@acme.com']),
+        );
+
+        self::assertTrue($result->skipped, 'login must be compared against login');
+        self::assertSame([], $writes, 'a skipped contact must not be written');
+    }
+
+    public function testAGenuinelyUnknownOwnerDoesNotMakeTheContactLookChangedForever(): void
+    {
+        // "No such user" is a final answer, so the owner is dropped from the
+        // payload — and must be dropped from the comparison too, or the contact
+        // differs on every run and is re-written forever.
+        $writes = [];
+        $http = $this->createMock(\GuzzleHttp\ClientInterface::class);
+        $http->method('send')->willReturnCallback(
+            function (\Psr\Http\Message\RequestInterface $request) use (&$writes) {
+                $path = strtolower($request->getUri()->getPath());
+
+                if (str_contains($path, 'users')) {
+                    // Answered, and there is no such user.
+                    return $this->jsonResponse(['result' => ['data' => [], 'total' => 0]]);
+                }
+
+                if ($request->getMethod() !== 'GET') {
+                    $writes[] = (string) $request->getBody();
+
+                    return $this->jsonResponse(['result' => ['name' => 'contact_1']]);
+                }
+
+                return $this->jsonResponse([
+                    'result' => ['data' => [['name' => 'contact_1', 'title' => 'Same']], 'total' => 1],
+                ]);
+            },
+        );
+        ApiCommunicator::getInstance('https://ownermissing.daktela.test', 'test-token')->setHttpClient($http);
+
+        $adapter = new DaktelaAdapter('https://ownermissing.daktela.test', 'test-token', 'test-db', new NullLogger());
+        $result = $adapter->upsertContact(
+            'name',
+            Contact::fromArray(['name' => 'contact_1', 'title' => 'Same', 'user' => 'ghost@acme.com']),
+        );
+
+        self::assertTrue($result->skipped, 'an unresolvable owner must not count as a change');
+        self::assertSame([], $writes);
     }
 
     /** @param array<string, mixed> $payload */

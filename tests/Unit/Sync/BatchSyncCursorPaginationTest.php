@@ -200,6 +200,95 @@ final class BatchSyncCursorPaginationTest extends TestCase
         self::assertSame([null], $adapter->cursorsSeen, 'no second page was requested');
     }
 
+    // ── custom entities take the same cursor rail (1.2.0) ───────────────────
+
+    /**
+     * A custom entity is read FROM the CRM, so on a cursor-only API it needs the
+     * cursor path exactly as contacts and accounts do. It was left on offsets:
+     * two of the three CRM-read entities paged correctly and the third re-read or
+     * skipped rows, on the same adapter, in the same run.
+     */
+    public function testACustomEntityDrainsByCursorOnACursorAdapter(): void
+    {
+        $store = new FileSyncStateStore($this->stateFile);
+        $adapter = new FakeCursorCrmAdapter([], [
+            '' => new CursorPage([['id' => 'r1', 'name' => 'r1', 'title' => 'r1']], 'CE_P2'),
+            'CE_P2' => new CursorPage([['id' => 'r2', 'name' => 'r2', 'title' => 'r2']], null),
+        ]);
+
+        $batch = $this->customEntityBatchSync($adapter, $store);
+        $entry = $this->customEntry();
+        $mapping = new MappingCollection('contact', 'name', [
+            new FieldMapping('name', 'name'),
+            new FieldMapping('title', 'title'),
+        ]);
+
+        self::assertFalse($batch->syncCustomEntity($entry, $mapping)->isExhausted(), 'live token keeps the drain open');
+        self::assertTrue($batch->syncCustomEntity($entry, $mapping)->isExhausted(), 'null token ends it');
+
+        self::assertSame([null, 'CE_P2'], $adapter->customCursorsSeen, 'each page resumed from the last token');
+        self::assertSame(['orders', 'orders'], $adapter->customEntitiesSeen, 'the entry source is passed through');
+        self::assertFalse($adapter->offsetPathUsed, 'a cursor adapter must never fall back to iterateCustomEntity()');
+    }
+
+    public function testACustomEntityStillUsesOffsetsOnANonCursorAdapter(): void
+    {
+        // The cursor path is opt-in; an adapter that has never heard of it keeps
+        // the offset behaviour it had in 1.1.0.
+        $store = new FileSyncStateStore($this->stateFile);
+        $adapter = new class extends \Daktela\CrmSync\Tests\Support\NullCrmAdapter {
+            /** @var list<int> */
+            public array $offsetsSeen = [];
+
+            public function iterateCustomEntity(string $entityName, ?\DateTimeImmutable $since = null, int $offset = 0): \Generator
+            {
+                $this->offsetsSeen[] = $offset;
+                yield ['id' => 'r1', 'name' => 'r1', 'title' => 'r1'];
+                yield ['id' => 'r2', 'name' => 'r2', 'title' => 'r2'];
+            }
+        };
+
+        $batch = $this->customEntityBatchSync($adapter, $store, batchSize: 1);
+        $entry = $this->customEntry();
+        $mapping = new MappingCollection('contact', 'name', [
+            new FieldMapping('name', 'name'),
+            new FieldMapping('title', 'title'),
+        ]);
+
+        self::assertFalse($batch->syncCustomEntity($entry, $mapping)->isExhausted());
+        $batch->syncCustomEntity($entry, $mapping);
+
+        self::assertSame([0, 1], $adapter->offsetsSeen, 'the offset advances by the records consumed');
+    }
+
+    private function customEntry(): \Daktela\CrmSync\Config\CustomEntitySyncConfig
+    {
+        return new \Daktela\CrmSync\Config\CustomEntitySyncConfig(
+            name: 'orders',
+            enabled: true,
+            direction: SyncDirection::CrmToCc,
+            source: 'orders',
+            target: \Daktela\CrmSync\Config\CustomEntitySyncConfig::TARGET_CONTACT,
+            mappingFile: 'o.yaml',
+        );
+    }
+
+    private function customEntityBatchSync(
+        CrmAdapterInterface $crm,
+        \Daktela\CrmSync\State\SyncStateStoreInterface $store,
+        int $batchSize = 1,
+    ): BatchSync {
+        $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
+        $ccAdapter->method('upsertContact')->willReturnCallback(
+            fn ($lookup, Contact $c) => new UpsertResult(
+                Contact::fromArray(array_merge($c->toArray(), ['id' => 'cc-' . $c->get('name')])),
+                created: true,
+            ),
+        );
+
+        return $this->batchSyncWith($ccAdapter, $crm, $store, $batchSize);
+    }
+
     private function batchSync(CrmAdapterInterface $crm, \Daktela\CrmSync\State\SyncStateStoreInterface $store, int $batchSize): BatchSync
     {
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);

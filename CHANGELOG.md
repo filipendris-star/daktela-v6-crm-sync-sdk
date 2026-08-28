@@ -1,135 +1,191 @@
 # Changelog
 
-## 1.4.0
+## 1.2.0
 
-Activity export is the focus of this release: it now refuses configurations that
-would push a customer's contact-centre history without being asked, exports the
-activity types it says it does, and never creates a CRM record it could have
-found.
+Activity export is the focus of this release: it exports the activity types it
+says it does, never creates a CRM record it could have found, and refuses
+configurations that would push a customer's contact-centre history without being
+asked.
 
-**A 1.x deployment can stop working on upgrade — read Breaking before rolling
-this out.** Most breaks below are loud: a thrown exception or a reported step
-failure on the first run. Two are silent and are marked as such.
+**A v1.1.0 deployment upgrades in place.** Only one config change is required, and
+only for deployments whose activity mapping came from the SDK's own example — see
+Required migration. Everything else in this release is additive or is a fault the
+config already had, now reported instead of hidden.
 
-### Breaking
+`tests/Regression/LegacyV110DeploymentTest.php` drives the frozen v1.1.0 example
+config through the loader, the factory and a full sync on every CI run, so that
+promise is enforced rather than asserted.
 
-- **`activity_types` is now required for an enabled activity entity.** Omitting it
-  used to load fine and silently export nothing, forever, with the watermark
-  advancing anyway. It is now rejected at config load.
-  *Migration:* add `activity_types: [call, email, ...]` to the activity entity.
+### Required migration
 
-- **An activity export with `initial_sync: now` requires a `SyncStateStore`.**
-  Without one there is no watermark to seed, so every run — not just the first —
-  pushes the full contact-centre history to the CRM. `SyncEngine` now refuses it,
-  and `SyncEngineFactory::fromYaml()` refuses to build without `$stateStorePath`.
-  *Migration:* pass a `SyncStateStoreInterface` as `stateStore:` to `SyncEngine`,
-  or `stateStorePath:` to `SyncEngineFactory::fromYaml()` — a writable path outside the config and release directories so it survives a redeploy.
+- **`lookup_field` on an activity mapping must name the CRM-side field.**
+  The v1.1.0 example shipped `lookup_field: name` — a `cc_field` — against
+  `crm_field: external_id`, so the export could never find the record it had
+  written and created a duplicate CRM activity on every run. Every config derived
+  from that example carries it.
 
-- **`initial_sync` is new, and defaults to `now`.** 1.x had no such setting and
-  always exported from the beginning of time. After upgrading, a first run seeds
-  the watermark and pushes nothing.
-  *Migration:* set `initial_sync: everything` to keep the old behaviour, or run
-  `fullSync(forceFullSync: true)` once for a deliberate historical push.
+  The mapping loader now rejects exactly that shape and names the value to use
+  (`Did you mean "external_id"?`). It does **not** fail the whole config: the
+  activity entity is disabled and reported, and contacts and accounts keep
+  syncing.
 
-- **Activity export always uses `upsertActivity()`, on both the batch and webhook
-  paths.** It is now the only duplicate protection for activity export.
-  *Adapter authors:* if your CRM has no activity-search endpoint, `upsertActivity()`
-  must fall back to `createActivity()` rather than letting `findActivityByLookup()`
-  throw — and be aware such a CRM accumulates a record per replayed window. Map the
-  Daktela activity id into a CRM field and point `lookup_field` at it.
+  *Migration:* point `lookup_field` at the CRM-side field carrying the Daktela
+  activity id. Dotted paths are **not** supported — `Activity::get()` is flat, so
+  a nested value cannot be read back.
 
-- **`ActivityType::Chat` now filters the API on `CHAT`, not `WEB`.** `web` is the
-  webhook event prefix; the platform stores web chats as `CHAT`. A configured
-  `activity_types: [web]` export matched nothing on every run in 1.x. It works
+  A value that does not *vary* per record — a static rule, or a default that fires
+  for everything — makes every activity resolve to the same CRM record and
+  overwrite it. That is only caught when two activities read in the same drain
+  share a value; it is **not** caught with `batch_size: 1`, on a quiet tenant, when
+  the colliding records land in different drains, or on the webhook path at all.
+  Verify per-record uniqueness yourself.
+
+### Behaviour changes
+
+Live for an existing deployment, but requiring no config change.
+
+- **Only CLOSED activities are exported.** The Daktela query now filters on
+  `action = CLOSE`. Closed activities are terminal, so one export is enough and no
+  later update is needed — but an activity that never closes is now never
+  exported. If you relied on open activities reaching your CRM, this changes what
+  you receive.
+
+- **`ActivityType::Chat` filters on `CHAT`, not `WEB`.** `web` is the webhook event
+  prefix; the platform stores web chats as `CHAT`. A configured
+  `activity_types: [web]` export matched nothing on every run in 1.1.0. It works
   now — **silent**: data starts flowing where none did, with no error to notice.
-  Check your CRM before enabling it on an existing install.
+  Check your CRM before enabling it on an existing install. The config value stays
+  `web`, so existing `activity_types` entries keep parsing.
 
-- **Timezone names in `date_format` are validated at config load.** A typo in
-  `from_tz`/`to_tz` used to fail only the records that carried a date, which made
-  the batch partially successful and advanced the watermark past the records it
-  dropped — permanent, silent loss. Bad zones are now rejected before the run.
-
-- **Activity exports now report `Updated`, not `Created`.** **Silent.** 1.x decided
+- **Activity exports report `Updated`, not `Created`.** **Silent.** 1.1.0 decided
   this by comparing the Daktela activity id with the CRM record id — two different
   systems' identifiers, never equal — so it reported `Created` for effectively
   every activity, in-place updates included. Both paths now report `Updated`
   ("the CRM now matches"), because `upsertActivity()` does not say which branch it
   took. A host reading `SyncResult::getCreatedCount()` for activities sees it go
-  from N to 0, and `getUpdatedCount()` from 0 to N.
+  from N to 0, and `getUpdatedCount()` from 0 to N. Sync behaviour is unchanged.
 
-- **`lookup_field` on an activity mapping must resolve to a per-record value in
-  the mapped CRM payload.** The export checks this at write time and **aborts the
-  step** if it does not — it is not a config-load check, because a loader can see
-  that a rule targets the field but not that the rule fired for a given record.
-  A missing value is always caught: `lookup_field` naming a `cc_field`, a rule
-  living only under a `types:` block that did not apply, or a dotted path.
+- **A per-entity config fault disables that entity instead of failing the load.**
+  An unknown `activity_types` value, an empty `activity_types` on an enabled
+  activity entity, an unknown `activity_type_map` key, an invalid `initial_sync`,
+  an unloadable mapping file, or an unsupported custom-entity `direction` now
+  disable *that entity* and are reported through
+  `FullSyncResult::hasStepFailures()`. The rest of the sync runs.
 
-  A value that does not *vary* per record — a static rule, or a default that
-  fires for everything — makes every activity resolve to the same CRM record and
-  overwrite it. That is only caught when two activities read in the same drain
-  share a value; it is **not** caught with `batch_size: 1`, on a quiet tenant
-  where runs carry one activity, when the colliding records land in different
-  drains, or on the webhook path at all. Verify per-record uniqueness yourself.
+  Several of these were silently tolerated in 1.1.0 — an unknown activity type was
+  dropped, leaving the list empty, so the export reported an exhausted 0-record
+  success and advanced the watermark on every run. They are now visible. A
+  scheduler gating on `hasStepFailures()` will start seeing failures it did not see
+  before, on configs that were already broken.
 
-  It aborts rather than failing records one at a time on purpose: the fault
-  applies to every record, and a per-record failure in a mixed-type batch is a
-  partial failure, which advances the watermark past the refused records.
+- **Timezone names in `date_format` are validated at load.** A typo in
+  `from_tz`/`to_tz` used to fail only the records that carried a date, which made
+  the batch partially successful and advanced the watermark past the records it
+  dropped — permanent, silent loss.
 
-  The SDK's own example, quickstart and test fixtures shipped the first mistake
-  (`lookup_field: name` against `crm_field: external_id`); all are corrected.
-  *Migration:* point `lookup_field` at the CRM-side field carrying the Daktela id.
-  Dotted paths are **not** supported for `lookup_field` — `Activity::get()` is
-  flat, so a nested value cannot be read back.
+- **`sync.batch_size` must be at least 1.** A smaller value degraded every drain to
+  one record per batch.
 
 ### Added
 
+- `initial_sync` (`now` / `everything`) on the activity entity: first-run behaviour
+  when no watermark exists yet. `now` seeds the watermark to the current time and
+  pushes nothing, so a first run does not flood the CRM with history; it requires a
+  `SyncStateStore` (there is nothing to seed without one) and
+  `SyncEngineFactory::fromYaml()` asks for `$stateStorePath`.
+
+  **Omitting the key keeps the pre-1.2.0 behaviour** (`everything`) and logs a
+  warning. The key is new, so no existing config can have opted into it, and
+  reading its absence as `now` would impose the state-store requirement on
+  deployments that never asked for it. **The default becomes `now` in 2.0** — set it
+  explicitly.
+
 - `ActivityType::InstagramDm` (`igdm`), on both the batch and webhook paths.
 - Opt-in adapter capabilities, feature-detected via `instanceof` so existing
-  adapters keep working without change: `SupportsCursorPaginationInterface` and
-  `SupportsDealLinkingInterface`. (`SupportsCustomEntityWriteInterface` ships as a
-  declared contract only — the engine does not consume it in this release, since
-  custom-entity export is not part of it.)
+  adapters keep working unchanged: `SupportsCursorPaginationInterface` (contacts,
+  accounts **and** custom entities — everything read from the CRM) and
+  `SupportsDealLinkingInterface`.
 - Per-activity-type field mapping (`default:` / `types:`), `value_map`, and
-  declared-format date conversion.
+  declared-format, timezone-aware date conversion.
 - Step isolation: one failing entity no longer aborts the others, and
   `FullSyncResult::hasStepFailures()` reports it.
-- Unroutable webhook events are logged as warnings instead of being answered
-  `200` in silence.
+- `SyncConfiguration::getEntityFaults()`: per-entity config faults, which
+  `SyncEngine` seeds into its step failures.
+- Unroutable webhook events are logged as warnings instead of being answered `200`
+  in silence.
+
+### Changed
+
+- **Activity export always uses `upsertActivity()`**, on both the batch and webhook
+  paths — as it did in 1.1.0. It is now the *only* duplicate protection for
+  activity export.
+
+  *Adapter authors:* if your CRM has no activity-search endpoint, `upsertActivity()`
+  must fall back to `createActivity()` rather than letting `findActivityByLookup()`
+  throw — and be aware such a CRM accumulates a record per replayed window.
+
+- `find*` on `CrmAdapterInterface` must now distinguish absence from failure:
+  return `null` only when the CRM answered and the record is genuinely not there,
+  and throw when the answer could not be obtained. Relation resolution treats
+  `null` as "nothing to resolve to" and passes the raw CRM key through, so an
+  adapter that returns `null` during an outage writes a raw CRM id into a Daktela
+  relation field and reports the record synced. Documentation only — no signature
+  changed.
+
+- The Daktela adapter flattens activity rows and derives nothing. `item_<field>` is
+  exposed exactly as the platform returned it, including the direction casing,
+  which varies by activity type (`in`/`out` for calls and emails, `IN`/`OUT` for
+  the chat family). A value combining two fields belongs in the CRM adapter — see
+  docs/03, "Deriving values the mapping engine cannot express".
 
 ### Removed
 
 - **The activity idempotency ledger** (`SyncLedgerInterface`,
   `SyncLedgerLookupInterface`, `SyncEngine::setLedger()`) and
-  `RecordNotFoundException`, which existed only to serve it. Never released — it
-  was added and removed within this development cycle, so there is nothing to
-  migrate from.
+  `RecordNotFoundException`. Never released — added and removed within this
+  development cycle, so there is nothing to migrate from.
 
   It duplicated what `upsertActivity()` already does, and the two disagreed: the
   ledger's "already exported" skip suppressed legitimate updates, so an activity
   edited after close, or exported by a webhook before it closed, was frozen in the
   CRM at its earlier state. Its key was `(entityType, ccId)` with no
   per-integration dimension, so two integrations sharing a store would skip each
-  other's records and hand each other the wrong CRM ids. If a CRM that genuinely
-  cannot search activities needs it, it can return as an opt-in in a later minor,
-  designed against a real adapter.
+  other's records and hand each other the wrong CRM ids.
 
 ### Fixed
 
-- A failed or empty API response is never read as "no records" (which advanced
-  the watermark past data that was never fetched).
+- A failed or empty API response is never read as "no records" (which advanced the
+  watermark past data that was never fetched).
 - The incremental activity window matches either `time_close` or `time`, so an
   activity that was postponed and later closed is not missed.
+- Relation resolution runs on the webhook path, as it always did on the batch path.
+  An account mapping carrying a `relation:` block got the raw CRM foreign key
+  written into Daktela on the webhook path and the resolved value on the batch one.
+- Activity pagination offsets are tracked per type. One shared offset was fed as
+  the skip to every type's query, so whenever an earlier type contributed rows to a
+  batch, the next batch started each remaining type past rows it never read.
+- Relation resolution accepts integer foreign keys. Numeric-id CRMs hand back
+  integers, and the previous `is_string()` guard silently skipped resolution for
+  them, writing the raw CRM id into the Daktela relation field.
+- A contact's owner email is resolved to a Daktela login once per upsert rather
+  than twice, and a transient lookup failure no longer reports the contact as
+  unchanged.
 
 ### Known limitations
 
-- On a CRM that cannot search activities, `upsertActivity()` cannot dedupe. This
-  is not limited to replayed windows: each webhook event of a multi-event call
-  (`call_create` → `call_answer` → `call_close`) creates its own CRM record, so
-  one call becomes three. The batch path's watermark bounds the damage there; the
-  webhook path has no such bound. Either subscribe only to `*_close` on such a
-  CRM, give the adapter a way to query by the Daktela activity id, or dedupe
-  CRM-side.
+- On a CRM that cannot search activities, `upsertActivity()` cannot dedupe. This is
+  not limited to replayed windows: each webhook event of a multi-event call
+  (`call_create` → `call_answer` → `call_close`) creates its own CRM record, so one
+  call becomes three. The batch path's watermark bounds the damage; the webhook path
+  has no such bound. Either subscribe only to `*_close` on such a CRM, give the
+  adapter a way to query by the Daktela activity id, or dedupe CRM-side.
 - The check that `lookup_field` varies per record is best-effort: it only sees
-  activities read in the same drain, and does not run on the webhook path. See
-  Breaking, above.
-- Custom-entity export (`cc_to_crm` custom entities) is not part of this release.
+  activities read in the same drain, and does not run on the webhook path.
+- Neither activity timestamp moves when an activity closes after being postponed,
+  so one postponed before a run and closed after it falls outside every later
+  window. Postponing applies to email, SMS and the chat channels, never to calls.
+  A deployment that postpones heavily should schedule a periodic forced run.
+- Custom-entity export (`cc_to_crm` custom entities) is not implemented.
+  `SupportsCustomEntityWriteInterface` ships as a compatibility declaration only —
+  the engine never calls it, and the config loader faults any enabled entry that
+  declares the direction.

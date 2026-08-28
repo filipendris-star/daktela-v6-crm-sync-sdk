@@ -126,7 +126,19 @@ final class SyncEngine
         ?callable $onBatch = null,
     ): FullSyncResult {
         $this->batchSync->setForceFullSync($forceFullSync);
-        $this->stepFailures = [];
+
+        // Entities the LOADER refused to enable start the run already failed. The
+        // fault is as real as one thrown mid-drain — the entity is not syncing — and
+        // it has to reach hasStepFailures() and the exit code, or a config typo reads
+        // as a clean run forever. The steps themselves are skipped: the loader left
+        // the entity disabled. See SyncConfiguration::getEntityFaults().
+        $this->stepFailures = $this->config->getEntityFaults();
+        foreach ($this->stepFailures as $entityType => $reason) {
+            $this->logger->error('Sync step {entityType} disabled by config: {reason}', [
+                'entityType' => $entityType,
+                'reason' => $reason,
+            ]);
+        }
 
         try {
             $accountResult = null;
@@ -434,7 +446,7 @@ final class SyncEngine
     /**
      * Refuse an activity export that would back-export history nobody asked for.
      *
-     * `initial_sync: now` — the default — means "do not push existing history".
+     * An EXPLICIT `initial_sync: now` means "do not push existing history".
      * Only a watermark can deliver that: the engine seeds it on the first run
      * and pushes nothing. With no state store there is nothing to seed, so the
      * first run exports the tenant's entire activity history, and so does every
@@ -445,6 +457,11 @@ final class SyncEngine
      * repeats it, which the adapter's upsert makes idempotent on a CRM that can
      * find an activity by its lookup field and does not on one that cannot — a
      * distinction the SDK cannot see, so it warns rather than guesses.
+     *
+     * An ABSENT `initial_sync` is treated as "everything" and warned about, never
+     * refused. The key is new in 1.2.0, so every config written against an earlier
+     * release omits it; refusing those would take a working deployment down on a
+     * minor upgrade to enforce a preference it never expressed.
      */
     private function assertActivityExportCanSeed(bool $forceFullSync): void
     {
@@ -462,8 +479,19 @@ final class SyncEngine
             return;
         }
 
+        // Only an EXPLICIT "now" is refused. See EntitySyncConfig::$initialSync.
         if ($activityConfig->initialSync === 'now') {
             throw ConfigurationException::activityExportNeedsAStateStore();
+        }
+
+        if ($activityConfig->initialSync === null) {
+            $this->logger->warning(
+                'Activity export has no initial_sync setting, so it keeps the pre-1.2.0 behaviour '
+                . '("everything"): EVERY run re-reads and re-writes the full contact-centre history. '
+                . 'Set initial_sync explicitly — "now" (which needs a state store) becomes the default in 2.0.',
+            );
+
+            return;
         }
 
         $this->logger->warning(

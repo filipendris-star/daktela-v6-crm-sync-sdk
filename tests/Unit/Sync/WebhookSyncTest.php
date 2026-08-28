@@ -116,7 +116,7 @@ final class WebhookSyncTest extends TestCase
             'activity_type' => 'call',
             'name' => 'call-1',
             'title' => 'Missed call',
-            'item_call_state' => 'in_missed',
+            'item_direction' => 'in_missed',
         ]);
 
         $ccAdapter = $this->createMock(ContactCentreAdapterInterface::class);
@@ -480,7 +480,7 @@ final class WebhookSyncTest extends TestCase
             ],
             [
                 'call' => [
-                    new FieldMapping('item_call_state', 'done', transformers: [
+                    new FieldMapping('item_direction', 'done', transformers: [
                         ['name' => 'value_map', 'params' => ['map' => ['in_missed' => 0], 'default' => 1]],
                     ]),
                 ],

@@ -242,8 +242,13 @@ implementing capability interfaces. The engine feature-detects them with
 
 For CRMs whose list APIs paginate by an opaque cursor (HubSpot `after`,
 Pipedrive v2 `cursor`, K2 `NextPageURL`) instead of a numeric offset.
-Implement `fetchContactsPage()` / `fetchAccountsPage()` returning a
-`CursorPage(records, nextCursor)`. The engine hands `nextCursor` back on the
+Implement `fetchContactsPage()`, `fetchAccountsPage()` and
+`fetchCustomEntityPage()` — everything read FROM the CRM — each returning a
+`CursorPage(records, nextCursor)`. `fetchCustomEntityPage()` returns RAW rows
+(flat associative arrays), matching `iterateCustomEntity()`; the other two return
+entities. An adapter with no custom-entity support throws
+`NotSupportedException` from `fetchCustomEntityPage()`, exactly as it already
+does from `iterateCustomEntity()`. The engine hands `nextCursor` back on the
 next page, so a drain completes within one run however many pages it takes.
 It is NOT persisted between runs: an interrupted drain restarts from the
 watermark, re-reading pages it already processed rather than resuming past

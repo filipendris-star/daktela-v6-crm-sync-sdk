@@ -52,6 +52,11 @@ final class SyncEngineFactory
         // paths every example passes. Instead, say what is missing — the engine
         // would refuse this config anyway, and here the message can name the
         // parameter to set.
+        //
+        // Gated on an EXPLICIT initial_sync: now. A config that omits the key
+        // predates it (new in 1.2.0) and keeps the pre-1.2.0 behaviour, so this
+        // two-argument fromYaml() call — the one every 1.x example used — keeps
+        // building. SyncEngine warns about it instead.
         $activityConfig = $syncConfig->getEntityConfig('activity');
         if ($stateStorePath === null
             && $activityConfig !== null

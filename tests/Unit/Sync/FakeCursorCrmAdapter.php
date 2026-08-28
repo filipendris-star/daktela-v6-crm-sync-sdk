@@ -14,17 +14,31 @@ use Daktela\CrmSync\Sync\CursorPage;
 
 /**
  * Minimal cursor-paginated CRM adapter for BatchSync tests: fetchContactsPage
- * returns a pre-seeded page keyed by the incoming cursor, and records which
- * cursors it was asked for.
+ * and fetchCustomEntityPage return a pre-seeded page keyed by the incoming
+ * cursor, and record which cursors they were asked for.
  */
 final class FakeCursorCrmAdapter implements CrmAdapterInterface, SupportsCursorPaginationInterface
 {
     /** @var array<int, string|null> */
     public array $cursorsSeen = [];
 
-    /** @param array<string, CursorPage<Contact>> $pagesByCursor keyed by incoming cursor ('' = first page / null) */
-    public function __construct(private readonly array $pagesByCursor)
-    {
+    /** @var array<int, string|null> cursors passed to fetchCustomEntityPage() */
+    public array $customCursorsSeen = [];
+
+    /** @var array<int, string> entity names passed to fetchCustomEntityPage() */
+    public array $customEntitiesSeen = [];
+
+    /** Set when iterateCustomEntity() is reached — it must not be, on a cursor adapter. */
+    public bool $offsetPathUsed = false;
+
+    /**
+     * @param array<string, CursorPage<Contact>> $pagesByCursor keyed by incoming cursor ('' = first page / null)
+     * @param array<string, CursorPage<array<string, mixed>>> $customPagesByCursor same, for custom entity rows
+     */
+    public function __construct(
+        private readonly array $pagesByCursor,
+        private readonly array $customPagesByCursor = [],
+    ) {
     }
 
     public function fetchContactsPage(?\DateTimeImmutable $since, ?string $cursor, int $limit): CursorPage
@@ -37,6 +51,18 @@ final class FakeCursorCrmAdapter implements CrmAdapterInterface, SupportsCursorP
     public function fetchAccountsPage(?\DateTimeImmutable $since, ?string $cursor, int $limit): CursorPage
     {
         return new CursorPage([], null);
+    }
+
+    public function fetchCustomEntityPage(
+        string $entityName,
+        ?\DateTimeImmutable $since,
+        ?string $cursor,
+        int $limit,
+    ): CursorPage {
+        $this->customCursorsSeen[] = $cursor;
+        $this->customEntitiesSeen[] = $entityName;
+
+        return $this->customPagesByCursor[$cursor ?? ''] ?? new CursorPage([], null);
     }
 
     // ── unused CrmAdapterInterface surface ───────────────────────────────────
@@ -112,6 +138,9 @@ final class FakeCursorCrmAdapter implements CrmAdapterInterface, SupportsCursorP
 
     public function iterateCustomEntity(string $entityName, ?\DateTimeImmutable $since = null, int $offset = 0): \Generator
     {
+        // A cursor adapter must never reach the offset path — that was the bug.
+        $this->offsetPathUsed = true;
+
         yield from [];
     }
 

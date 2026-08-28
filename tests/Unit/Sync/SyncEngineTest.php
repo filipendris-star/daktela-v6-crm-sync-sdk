@@ -760,7 +760,13 @@ final class SyncEngineTest extends TestCase
             accessToken: 't',
             database: 'd',
             batchSize: 100,
-            entities: ['activity' => new EntitySyncConfig(false, SyncDirection::CcToCrm, 'activities.yaml', [ActivityType::Call])],
+            entities: ['activity' => new EntitySyncConfig(
+                false,
+                SyncDirection::CcToCrm,
+                'activities.yaml',
+                [ActivityType::Call],
+                initialSync: 'now',
+            )],
             mappings: [],
         );
 

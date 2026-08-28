@@ -150,11 +150,8 @@ final class BatchSync
         // adapter whose has_more never turns false is a bug to fix in the adapter;
         // bounding a run's total work belongs to the process that schedules it.
 
-        $exhausted = $nextCursor === null;
-        $next = $nextCursor;
-
-        $result->setExhausted($exhausted);
-        $this->cursors[$key] = $next;
+        $result->setExhausted($nextCursor === null);
+        $this->cursors[$key] = $nextCursor;
     }
 
     /**
@@ -338,10 +335,15 @@ final class BatchSync
 
         $since = $this->resolveSince('activity');
 
-        // First run (no cursor): with initial_sync "now" (the default) we seed the
+        // First run (no cursor): with an EXPLICIT initial_sync "now" we seed the
         // cursor to the current time and push nothing — flooding the CRM with full
         // CC history is almost never intended. Opt out with `initial_sync: everything`,
         // or use forceFullSync for an explicit one-off historical push.
+        //
+        // An ABSENT initial_sync does not seed. The key is new in 1.2.0, so a config
+        // that predates it never chose this, and seeding on its behalf would silently
+        // drop the history a pre-1.2.0 deployment was exporting. See
+        // EntitySyncConfig::$initialSync.
         if ($since === null && !$this->forceFullSync && $this->stateStore !== null) {
             // Only a *configured* activity entity opts into the seeding rail. A
             // direct programmatic call without config passed explicit types and
@@ -443,40 +445,54 @@ final class BatchSync
 
         $offsetKey = "custom:{$entry->name}";
         $since = $this->resolveSince($offsetKey);
-        $offset = $this->offsets[$offsetKey] ?? 0;
         $result = new SyncResult();
-        $count = 0;
-        $exhausted = true;
 
         $upsertFn = $this->buildUpsertFn($entry->target);
 
-        foreach ($this->crmAdapter->iterateCustomEntity($entry->source, $since, $offset) as $rawRecord) {
-            $entity = $this->wrapForTarget($entry->target, $rawRecord);
-
-            $record = $this->syncEntityToCc(
-                entity: $entity,
+        $processRecord = function (array $rawRecord) use ($entry, $mapping, $upsertFn, $result): void {
+            $result->addRecord($this->syncEntityToCc(
+                entity: $this->wrapForTarget($entry->target, $rawRecord),
                 mapping: $mapping,
                 entityType: $entry->target,
                 upsertFn: $upsertFn,
+            ));
+        };
+
+        // A custom entity is read from the CRM, so it takes the same cursor rail as
+        // contacts and accounts. Left on offsets, a cursor-only CRM either re-read
+        // or skipped rows here while the other two entities paged correctly.
+        if ($this->crmAdapter instanceof SupportsCursorPaginationInterface) {
+            $cursor = $this->resolveCursor($offsetKey);
+            $page = $this->crmAdapter->fetchCustomEntityPage(
+                $entry->source,
+                $since,
+                $cursor,
+                $this->config->batchSize,
             );
-
-            $result->addRecord($record);
-            $count++;
-
-            if ($count >= $this->config->batchSize) {
-                $exhausted = false;
-                break;
+            foreach ($page->records as $rawRecord) {
+                $processRecord($rawRecord);
             }
-        }
-
-        $result->setExhausted($exhausted);
-        $result->finish();
-
-        if ($exhausted) {
-            $this->offsets[$offsetKey] = 0;
+            $this->advanceCursor($offsetKey, $page, $result, $cursor);
         } else {
-            $this->offsets[$offsetKey] = $offset + $count;
+            $offset = $this->offsets[$offsetKey] ?? 0;
+            $count = 0;
+            $exhausted = true;
+
+            foreach ($this->crmAdapter->iterateCustomEntity($entry->source, $since, $offset) as $rawRecord) {
+                $processRecord($rawRecord);
+                $count++;
+
+                if ($count >= $this->config->batchSize) {
+                    $exhausted = false;
+                    break;
+                }
+            }
+
+            $result->setExhausted($exhausted);
+            $this->offsets[$offsetKey] = $exhausted ? 0 : $offset + $count;
         }
+
+        $result->finish();
 
         $this->logger->info('Batch custom entity {name} sync completed (source: {source}, target: {target})', [
             'name' => $entry->name,
@@ -581,7 +597,7 @@ final class BatchSync
                 // with no rules for a type is wrong for every activity of that
                 // type, and failing them one at a time makes a mixed batch a
                 // PARTIAL failure — which advances the watermark past exactly the
-                // records it refused. That was live here until now.
+                // records it refused.
                 //
                 // The cost is a stall: one undedupable or unmapped type stops the
                 // whole activity step, so a healthy type stops progressing too
@@ -597,13 +613,13 @@ final class BatchSync
             // to look up and creates on every run — silently, since "found
             // nothing then created" and "created" look identical downstream.
             //
-            // A config-load check was tried and removed: it could only see that
-            // some rule targets the field, not that the rule fired for this
-            // record, and it grew a hole for every way of getting that wrong
-            // (a lookup_field naming a cc_field, one written only under a
-            // `types:` block that did not apply here, a dotted path
-            // Activity::get() cannot resolve, a static or append rule, a mapping
-            // built in code and never loaded from YAML).
+            // It has to be checked HERE and not at config load: a loader can see
+            // that some rule targets the field, never that the rule fired for a
+            // given record. YamlMappingLoader catches the one shape it genuinely
+            // can (lookup_field naming a cc_field); everything else — a rule under
+            // a `types:` block that did not apply, a dotted path Activity::get()
+            // cannot resolve, a static rule, a mapping built in code — is only
+            // knowable once the payload exists.
             $mappedActivity = Activity::fromArray($mapped);
 
             if ($activity->getActivityType() !== null) {

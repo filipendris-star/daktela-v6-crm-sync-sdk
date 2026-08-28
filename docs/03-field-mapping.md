@@ -40,10 +40,11 @@ default:
 types:
   call:
     mappings:
-      - cc_field: item_call_state
-        crm_field: done
+      - cc_field: item_direction
+        crm_field: direction
         transformers:
-          - { name: value_map, params: { map: { in_missed: 0 }, default: 1 } }
+          - { name: value_map, params: { map: { in: inbound, out: outbound, IN: inbound, OUT: outbound } } }
+      - { cc_field: item_answered, crm_field: answered }
   sms:
     mappings:
       - { cc_field: item_text, crm_field: note }
@@ -71,16 +72,25 @@ once the mapping is fixed, the next run exports the records properly.
 nested relations so rules can address them as scalars: `user_email`,
 `user_login`, `user_title`, `contact_name`, and `item_<field>` for every
 scalar field of the type-specific item record (`item_direction`,
-`item_answered`, `item_text`, ...). For any item carrying **both**
-`item_direction` and `item_answered` it also derives **`item_call_state`** —
-one token (`out_answered`, `out_noanswer`, `in_answered`, `in_missed`,
-`internal_answered`, `internal_noanswer`) that a single `value_map` can turn
-into a CRM `done` flag or subject, which two separate fields cannot express.
-Calls, emails and the chat channels all qualify; the direction is matched
-case-insensitively, since the platform stores it lowercase for calls and
-emails but uppercase for the chat family. An item without `item_answered`
-(so no answered/unanswered distinction exists) gets no `item_call_state` at
-all rather than a guessed one.
+`item_answered`, `item_text`, ...). `item` is type-specific, so which `item_*`
+fields exist differs per activity type.
+
+Flattening only: every field is one the platform returned, with the value it
+returned. Nothing is derived, combined or normalised — including the direction,
+which the platform stores lowercase (`in`/`out`) for calls and emails but
+uppercase (`IN`/`OUT`) for the chat family. A `value_map` that lists only one
+case sends the rest to its default.
+
+**Deriving values the mapping engine cannot express.** A rule reads one source
+field, and a transformer sees only that scalar, so a value combining *two* fields
+— a call state from `item_direction` × `item_answered`, say — cannot be produced
+by a mapping rule.
+
+Do it in your CRM adapter, not in the SDK. Map both source fields through to the
+payload and combine them in `upsertActivity()`. What a combination of Daktela
+fields *means* to a particular CRM is that CRM's concern: the SDK ships the
+platform's data faithfully and stays out of the interpretation, so no one CRM's
+vocabulary ends up baked into the shared adapter.
 
 **`lookup_field` addresses different sides per direction.** On import
 (`crm_to_cc`) the upsert looks up the *CC-side* record, so `lookup_field`

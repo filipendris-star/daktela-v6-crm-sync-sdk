@@ -182,7 +182,7 @@ $engine = new SyncEngine($ccAdapter, $crmAdapter, $config, $logger, $registry,
 
 ## Incremental Sync
 
-By default, every batch sync fetches all records. (An activity export with `initial_sync: now` needs a state store — see the note below.) To enable incremental sync, pass a `SyncStateStoreInterface` implementation to the engine. The SDK ships with `FileSyncStateStore`:
+By default, every batch sync fetches all records. (An activity export with an explicit `initial_sync: now` needs a state store — see the note below.) To enable incremental sync, pass a `SyncStateStoreInterface` implementation to the engine. The SDK ships with `FileSyncStateStore`:
 
 ```php
 use Daktela\CrmSync\State\FileSyncStateStore;

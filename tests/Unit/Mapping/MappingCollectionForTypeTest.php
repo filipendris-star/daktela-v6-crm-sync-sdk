@@ -181,13 +181,13 @@ final class MappingCollectionForTypeTest extends TestCase
             types:
               call:
                 mappings:
-                  - { cc_field: item_call_state, crm_field: subject }
+                  - { cc_field: item_direction, crm_field: subject }
             YAML);
 
         $call = $collection->forType('call');
 
         self::assertCount(2, $call->mappings);
-        self::assertSame('item_call_state', $call->mappings[0]->ccField, 'type rule replaces base subject rule in place');
+        self::assertSame('item_direction', $call->mappings[0]->ccField, 'type rule replaces base subject rule in place');
         self::assertSame('note', $call->mappings[1]->crmField);
     }
 }

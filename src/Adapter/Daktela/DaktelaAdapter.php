@@ -66,55 +66,31 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
             throw AdapterException::missingId('contact');
         }
 
-        // Resolve a mapped owner email (e.g. CRM owner -> Daktela user) to the
-        // user login up-front so hasChanges() compares login against login and
-        // unchanged contacts are skipped instead of re-updated every run.
-        $userValue = $contact->get('user');
-        $userNotFound = false;
-        if (is_string($userValue) && str_contains($userValue, '@')) {
-            $resolved = $this->findUserLoginByEmail($userValue);
-            if ($resolved !== null) {
-                $contact->set('user', $resolved);
-                // The write path (prepareContactData) re-triggers on any 'user'
-                // containing '@' — now against the LOGIN we just resolved. Where
-                // logins are email-shaped that is two wasted Users reads per
-                // contact, and on a miss it strips the owner and negative-caches
-                // a perfectly valid login. Cache the login as its own answer so
-                // the second lookup resolves to itself instead of querying.
-                $this->userLoginCache[strtolower($resolved)] = $resolved;
-            } else {
-                // Distinguish "no such user" (negative result cached) from a
-                // transient lookup failure (never cached): only a genuine
-                // not-found may be dropped from the change comparison below. A
-                // transient failure must keep the contact "changed", so the
-                // update path's prepareContactData() retries the lookup instead
-                // of a skip silently eating an owner-only change.
-                $userNotFound = array_key_exists(strtolower($userValue), $this->userLoginCache);
-            }
-        }
+        // Resolve the owner ONCE, here. The payload this produces is both what the
+        // change comparison sees and what gets written, so login is compared against
+        // login (unchanged contacts stay skipped instead of being re-updated every
+        // run) without the write path resolving a second time.
+        [$prepared, $ownerLookupFailed] = $this->resolveContactOwner($contact->getData());
 
         $existing = $this->findContactBy([$lookupField => (string) $lookupValue]);
 
         if ($existing !== null && $existing->getId() !== null) {
-            // A genuinely unresolvable owner email is dropped by the write path
-            // (prepareContactData), so drop it from the change comparison too —
-            // otherwise the contact looks "changed" on every run and a no-op PUT
-            // bumps `edited` forever.
-            $newData = $contact->getData();
-            if ($userNotFound && isset($newData['user']) && is_string($newData['user']) && str_contains($newData['user'], '@')) {
-                unset($newData['user']);
-            }
-
-            if (!$this->hasChanges($existing->getData(), $newData)) {
+            // A failed owner LOOKUP is never reported as "no changes": nothing is
+            // known about the owner, and an unchanged CRM record does not come back
+            // into the incremental window to be retried. A genuine not-found is
+            // already absent from $prepared, so it compares equal and skips.
+            if (!$ownerLookupFailed && !$this->hasChanges($existing->getData(), $prepared)) {
                 $this->logger->debug('Skip contact update: no changes', ['id' => $existing->getId()]);
 
                 return new UpsertResult($existing, skipped: true);
             }
 
-            return new UpsertResult($this->updateContact($existing->getId(), $contact));
+            return new UpsertResult(
+                Contact::fromArray($this->updateEntity('Contacts', $existing->getId(), $prepared)),
+            );
         }
 
-        return new UpsertResult($this->createContact($contact), created: true);
+        return new UpsertResult(Contact::fromArray($this->createEntity('Contacts', $prepared)), created: true);
     }
 
     public function findAccount(string $id): ?Account
@@ -187,31 +163,72 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
      */
     private function prepareContactData(array $data): array
     {
+        return $this->resolveContactOwner($data)[0];
+    }
+
+    /**
+     * The ONE place a contact's owner email is turned into a Daktela user login.
+     *
+     * Resolution used to happen twice per contact — once in upsertContact() so the
+     * change comparison could compare login against login, and again on the write
+     * path — with the second call papered over by seeding the cache with
+     * `login => login` so it resolved to itself. Two lookups per contact where
+     * logins are email-shaped, and a valid login could be negative-cached on a miss.
+     * Resolving once and carrying the payload to the write removes both.
+     *
+     * The second return value distinguishes the two ways `user` can be dropped,
+     * which callers must not conflate:
+     *   false — the CRM answered and there is no such Daktela user. Dropping the
+     *           owner is final, so the comparison must drop it too, or the contact
+     *           reads as changed on every run and a no-op PUT bumps `edited` forever.
+     *   true  — the lookup could not be performed (API fault). Nothing is known, so
+     *           the contact must NOT be reported unchanged: skipping it here is what
+     *           silently eats an owner-only change, since an unchanged CRM record
+     *           does not re-enter the incremental window to be retried.
+     *
+     * @param array<string, mixed> $data
+     * @return array{0: array<string, mixed>, 1: bool} [payload, ownerLookupFailed]
+     */
+    private function resolveContactOwner(array $data): array
+    {
         $user = $data['user'] ?? null;
         if (!is_string($user) || !str_contains($user, '@')) {
-            return $data;
+            return [$data, false];
         }
 
-        $login = $this->findUserLoginByEmail($user);
+        $lookupFailed = false;
+        $login = $this->findUserLoginByEmail($user, $lookupFailed);
         if ($login !== null) {
             $data['user'] = $login;
 
-            return $data;
+            return [$data, false];
         }
 
-        $this->logger->warning('No Daktela user with email {email} — leaving contact owner untouched', [
-            'email' => $user,
-        ]);
+        if ($lookupFailed) {
+            $this->logger->warning(
+                'Could not look up the Daktela user for {email} — the contact is written without '
+                . 'touching its owner, and the owner is applied on a later run.',
+                ['email' => $user],
+            );
+        } else {
+            $this->logger->warning('No Daktela user with email {email} — leaving contact owner untouched', [
+                'email' => $user,
+            ]);
+        }
+
         unset($data['user']);
 
-        return $data;
+        return [$data, $lookupFailed];
     }
 
     /**
      * Resolve a Daktela user login by email (notification email first, auth
      * email as fallback). Cached per adapter instance (one sync run).
+     *
+     * @param bool $lookupFailed set to true when the lookup could not be performed,
+     *        as opposed to answering "no such user"
      */
-    private function findUserLoginByEmail(string $email): ?string
+    private function findUserLoginByEmail(string $email, bool &$lookupFailed = false): ?string
     {
         $cacheKey = strtolower($email);
         if (array_key_exists($cacheKey, $this->userLoginCache)) {
@@ -266,8 +283,21 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
      *               per-type record (item_direction, item_answered, ...).
      *               `item` is type-specific (call, sms, email, ...), so the
      *               available item_* fields differ per activity type.
-     *  - item_call_state, derived from item_direction x item_answered for any
-     *    item carrying both (see below).
+     *
+     * Flattening only. Every key here is a field the platform actually returned,
+     * carrying the value it returned — nothing is derived, combined or normalised.
+     *
+     * That boundary is deliberate. This adapter's job is to present Daktela's data;
+     * deciding what a combination of fields MEANS to a given CRM is the CRM
+     * adapter's job, and a derived token shaped by one CRM's vocabulary does not
+     * belong in a universal SDK. A CRM that needs, say, a single call-state value
+     * from `item_direction` × `item_answered` maps both fields through and combines
+     * them in its own adapter. See docs/03-field-mapping.md, "Deriving values the
+     * mapping engine cannot express".
+     *
+     * One quirk worth knowing when you do: the platform is not consistent about
+     * direction casing — call and email items store 'in'/'out' while the chat family
+     * (web, fbm, wap, viber) stores 'IN'/'OUT'. Case-fold before comparing.
      *
      * @param array<string, mixed> $row
      * @return array<string, mixed>
@@ -295,30 +325,6 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
                     $row['item_' . $field] = $value;
                 }
             }
-        }
-
-        // Derive a single call-state token from direction + answered so field
-        // mappings can drive Pipedrive `done`/`subject`/`type` with one value_map.
-        // The mapping engine reads one source field per rule and transformers see
-        // only that scalar, so a state that depends on *two* item fields
-        // (direction × answered) is not expressible from the raw fields alone.
-        // An unanswered inbound call is a missed call regardless of the
-        // `missed_call` flag, so direction + answered fully determine the state.
-        //
-        // Derived for every item type carrying both fields, not just calls:
-        // direction x answered is equally meaningful for a chat or an SMS. The
-        // direction is case-folded because the platform is not consistent about
-        // it — call and email items store 'in'/'out' while the chat family
-        // (web, fbm, wap, viber) stores 'IN'/'OUT', which used to miss both arms
-        // and land every chat in the internal_* default.
-        if (isset($row['item_direction']) && array_key_exists('item_answered', $row)) {
-            $direction = strtolower((string) $row['item_direction']);
-            $answered = !empty($row['item_answered']);
-            $row['item_call_state'] = match ($direction) {
-                'in' => $answered ? 'in_answered' : 'in_missed',
-                'out' => $answered ? 'out_answered' : 'out_noanswer',
-                default => $answered ? 'internal_answered' : 'internal_noanswer',
-            };
         }
 
         return $row;

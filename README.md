@@ -63,7 +63,7 @@ foreach ($results->toArray() as $type => $result) {
 }
 ```
 
-> **Activity export needs a state store.** With the default `initial_sync: now`
+> **Activity export needs a state store.** With `initial_sync: now`
 > the engine seeds a watermark on the first run and pushes no history. Without a
 > state store there is nothing to seed, so the engine refuses rather than push the
 > full contact-centre history on every run. Pass `stateStore:` as shown in

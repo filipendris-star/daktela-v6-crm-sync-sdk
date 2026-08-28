@@ -24,6 +24,15 @@ class FakeCcAdapter implements ContactCentreAdapterInterface
     /** @var array<string, Account> */
     public array $accounts = [];
 
+    /**
+     * Every iterateActivities() call, in order. Lets a test tell "the export ran
+     * and found nothing" apart from "the export never ran" — the difference
+     * between a healthy quiet tenant and a seeded-away watermark.
+     *
+     * @var list<array{type: string, since: ?\DateTimeImmutable, offset: int}>
+     */
+    public array $activityQueries = [];
+
     /** @var array<string, true> lookup values that should fail contact upsert */
     private array $failContactLookups = [];
 
@@ -147,6 +156,8 @@ class FakeCcAdapter implements ContactCentreAdapterInterface
 
     public function iterateActivities(ActivityType $type, ?\DateTimeImmutable $since = null, int $offset = 0): \Generator
     {
+        $this->activityQueries[] = ['type' => $type->value, 'since' => $since, 'offset' => $offset];
+
         yield from [];
     }
 
