@@ -32,10 +32,13 @@ use Daktela\CrmSync\Sync\CursorPage;
  * the terminating null right is the adapter's responsibility, and bounding a
  * run's total work belongs to whatever schedules it (see docs/09).
  *
- * Applies to everything read FROM the CRM: contacts, accounts, and custom
- * entities. Activities flow cc_to_crm and are read from the Contact Centre
- * adapter, so they are not covered here. Adapters that do NOT implement this keep
- * using the integer-offset iterate* path.
+ * Applies to contacts and accounts. Activities flow cc_to_crm and are read from
+ * the Contact Centre adapter, so they are not covered here. Custom entities are
+ * also read from the CRM and need the same treatment, but they live in the
+ * separate {@see SupportsCustomEntityCursorPaginationInterface} so that adding
+ * them cannot stop an existing cursor adapter from loading.
+ *
+ * Adapters that do NOT implement this keep using the integer-offset iterate* path.
  */
 interface SupportsCursorPaginationInterface
 {
@@ -44,25 +47,4 @@ interface SupportsCursorPaginationInterface
 
     /** @return CursorPage<\Daktela\CrmSync\Entity\Account> */
     public function fetchAccountsPage(?\DateTimeImmutable $since, ?string $cursor, int $limit): CursorPage;
-
-    /**
-     * The cursor-paginated form of iterateCustomEntity(). Required for the same
-     * reason as the other two: a custom entity is read from the CRM, so on a
-     * cursor-only API the offset path either re-reads or skips rows.
-     *
-     * `$entityName` is the adapter-interpreted `source` from the entry's config,
-     * exactly as iterateCustomEntity() receives it. Rows are returned RAW — flat
-     * associative arrays, not entities — matching iterateCustomEntity().
-     *
-     * An adapter with no custom-entity support throws NotSupportedException here,
-     * as it already does for iterateCustomEntity().
-     *
-     * @return CursorPage<array<string, mixed>>
-     */
-    public function fetchCustomEntityPage(
-        string $entityName,
-        ?\DateTimeImmutable $since,
-        ?string $cursor,
-        int $limit,
-    ): CursorPage;
 }

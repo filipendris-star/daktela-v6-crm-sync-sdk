@@ -7,6 +7,7 @@ namespace Daktela\CrmSync\Sync;
 use Daktela\CrmSync\Adapter\ContactCentreAdapterInterface;
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\SupportsCursorPaginationInterface;
+use Daktela\CrmSync\Adapter\SupportsCustomEntityCursorPaginationInterface;
 use Daktela\CrmSync\Adapter\SupportsDealLinkingInterface;
 use Daktela\CrmSync\Adapter\UpsertResult;
 use Daktela\CrmSync\Config\SkipIfExistsMode;
@@ -461,7 +462,12 @@ final class BatchSync
         // A custom entity is read from the CRM, so it takes the same cursor rail as
         // contacts and accounts. Left on offsets, a cursor-only CRM either re-read
         // or skipped rows here while the other two entities paged correctly.
-        if ($this->crmAdapter instanceof SupportsCursorPaginationInterface) {
+        //
+        // Its own capability interface, so adopting it is independent of
+        // SupportsCursorPaginationInterface: an adapter that paginates contacts and
+        // accounts by cursor but has not implemented this yet keeps the offset path
+        // here rather than failing to load.
+        if ($this->crmAdapter instanceof SupportsCustomEntityCursorPaginationInterface) {
             $cursor = $this->resolveCursor($offsetKey);
             $page = $this->crmAdapter->fetchCustomEntityPage(
                 $entry->source,

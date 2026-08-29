@@ -102,9 +102,16 @@ Live for an existing deployment, but requiring no config change.
 
 - `ActivityType::InstagramDm` (`igdm`), on both the batch and webhook paths.
 - Opt-in adapter capabilities, feature-detected via `instanceof` so existing
-  adapters keep working unchanged: `SupportsCursorPaginationInterface` (contacts,
-  accounts **and** custom entities — everything read from the CRM) and
+  adapters keep working unchanged: `SupportsCursorPaginationInterface` (contacts
+  and accounts), `SupportsCustomEntityCursorPaginationInterface` (custom entities,
+  which are read from the CRM and need the same treatment) and
   `SupportsDealLinkingInterface`.
+
+  Custom-entity cursor paging is a separate interface on purpose: adding a third
+  required method to `SupportsCursorPaginationInterface` would stop every adapter
+  already implementing it from loading until updated — the break this release
+  exists to stop repeating. Adopt it when convenient; without it, custom entities
+  keep the offset path. The two may merge in 2.0.
 - Per-activity-type field mapping (`default:` / `types:`), `value_map`, and
   declared-format, timezone-aware date conversion.
 - Step isolation: one failing entity no longer aborts the others, and
@@ -135,8 +142,23 @@ Live for an existing deployment, but requiring no config change.
 - The Daktela adapter flattens activity rows and derives nothing. `item_<field>` is
   exposed exactly as the platform returned it, including the direction casing,
   which varies by activity type (`in`/`out` for calls and emails, `IN`/`OUT` for
-  the chat family). A value combining two fields belongs in the CRM adapter — see
-  docs/03, "Deriving values the mapping engine cannot express".
+  the chat family).
+
+  The `item_call_state` token an interim build derived from
+  `item_direction` × `item_answered` is gone. Never released, so no deployment
+  loses it — but a config written against this branch needs its rules moved. The
+  capability did not disappear, it moved to where it belongs: map both source
+  fields through and combine them in your adapter's `upsertActivity()`.
+  docs/04, ["Deriving a Value From Two Daktela Fields"](docs/04-implementing-crm-adapter.md#deriving-a-value-from-two-daktela-fields),
+  is a complete worked example — the YAML and the adapter code that turns the two
+  fields into a CRM's `done`/`subject`/`type`, including the casing and `"0"`
+  serialisation traps. `tests/Unit/Adapter/DerivedActivityStateExampleTest.php`
+  executes that recipe, so it cannot rot.
+
+  It was removed because its value vocabulary was chosen to feed one CRM's
+  `value_map`: what a *combination* of Daktela fields means to a given CRM is that
+  integration's business logic, and the shared platform adapter is the wrong place
+  for it.
 
 ### Removed
 

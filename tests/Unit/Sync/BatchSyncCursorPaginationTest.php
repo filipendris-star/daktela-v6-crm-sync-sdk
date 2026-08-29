@@ -261,6 +261,71 @@ final class BatchSyncCursorPaginationTest extends TestCase
         self::assertSame([0, 1], $adapter->offsetsSeen, 'the offset advances by the records consumed');
     }
 
+    /**
+     * Custom-entity cursor paging is its OWN capability interface, so an adapter
+     * that paginates contacts and accounts by cursor but has not adopted it yet
+     * keeps the offset path for custom entities — rather than failing to load
+     * because a third method appeared on an interface it already implements.
+     *
+     * That is the whole reason the interfaces are split; without this test the
+     * split could be quietly undone by moving the method back.
+     */
+    public function testACursorAdapterWithoutTheCustomEntityCapabilityStillUsesOffsets(): void
+    {
+        $store = new FileSyncStateStore($this->stateFile);
+
+        $adapter = new class implements
+            \Daktela\CrmSync\Adapter\CrmAdapterInterface,
+            \Daktela\CrmSync\Adapter\SupportsCursorPaginationInterface
+        {
+            /** @var list<int> */
+            public array $offsetsSeen = [];
+
+            public function fetchContactsPage(?\DateTimeImmutable $since, ?string $cursor, int $limit): CursorPage
+            {
+                return new CursorPage([], null);
+            }
+
+            public function fetchAccountsPage(?\DateTimeImmutable $since, ?string $cursor, int $limit): CursorPage
+            {
+                return new CursorPage([], null);
+            }
+
+            public function iterateCustomEntity(string $entityName, ?\DateTimeImmutable $since = null, int $offset = 0): \Generator
+            {
+                $this->offsetsSeen[] = $offset;
+                yield ['id' => 'r1', 'name' => 'r1', 'title' => 'r1'];
+            }
+
+            public function findContact(string $id): ?\Daktela\CrmSync\Entity\Contact { return null; }
+            public function findContactByLookup(string $field, string $value): ?\Daktela\CrmSync\Entity\Contact { return null; }
+            public function iterateContacts(?\DateTimeImmutable $since = null, int $offset = 0): \Generator { yield from []; }
+            public function findAccount(string $id): ?\Daktela\CrmSync\Entity\Account { return null; }
+            public function findAccountByLookup(string $field, string $value): ?\Daktela\CrmSync\Entity\Account { return null; }
+            public function iterateAccounts(?\DateTimeImmutable $since = null, int $offset = 0): \Generator { yield from []; }
+            public function searchContacts(string $query): \Generator { yield from []; }
+            public function searchAccounts(string $query): \Generator { yield from []; }
+            public function findActivity(string $id): ?\Daktela\CrmSync\Entity\Activity { return null; }
+            public function findActivityByLookup(string $field, string $value): ?\Daktela\CrmSync\Entity\Activity { return null; }
+            public function createActivity(\Daktela\CrmSync\Entity\Activity $a): \Daktela\CrmSync\Entity\Activity { return $a; }
+            public function updateActivity(string $id, \Daktela\CrmSync\Entity\Activity $a): \Daktela\CrmSync\Entity\Activity { return $a; }
+            public function upsertActivity(string $lookupField, \Daktela\CrmSync\Entity\Activity $a): \Daktela\CrmSync\Entity\Activity { return $a; }
+            public function findCustomEntity(string $entityName, string $id): ?array { return null; }
+            public function findCustomEntityByLookup(string $entityName, string $field, string $value): ?array { return null; }
+            public function ping(): bool { return true; }
+        };
+
+        $batch = $this->customEntityBatchSync($adapter, $store, batchSize: 1);
+        $mapping = new MappingCollection('contact', 'name', [
+            new FieldMapping('name', 'name'),
+            new FieldMapping('title', 'title'),
+        ]);
+
+        $batch->syncCustomEntity($this->customEntry(), $mapping);
+
+        self::assertSame([0], $adapter->offsetsSeen, 'the offset path must still be reachable');
+    }
+
     private function customEntry(): \Daktela\CrmSync\Config\CustomEntitySyncConfig
     {
         return new \Daktela\CrmSync\Config\CustomEntitySyncConfig(

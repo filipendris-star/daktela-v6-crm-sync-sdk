@@ -6,6 +6,7 @@ namespace Daktela\CrmSync\Tests\Unit\Sync;
 
 use Daktela\CrmSync\Adapter\CrmAdapterInterface;
 use Daktela\CrmSync\Adapter\SupportsCursorPaginationInterface;
+use Daktela\CrmSync\Adapter\SupportsCustomEntityCursorPaginationInterface;
 use Daktela\CrmSync\Entity\Account;
 use Daktela\CrmSync\Entity\Activity;
 use Daktela\CrmSync\Entity\ActivityType;
@@ -17,7 +18,10 @@ use Daktela\CrmSync\Sync\CursorPage;
  * and fetchCustomEntityPage return a pre-seeded page keyed by the incoming
  * cursor, and record which cursors they were asked for.
  */
-final class FakeCursorCrmAdapter implements CrmAdapterInterface, SupportsCursorPaginationInterface
+final class FakeCursorCrmAdapter implements
+    CrmAdapterInterface,
+    SupportsCursorPaginationInterface,
+    SupportsCustomEntityCursorPaginationInterface
 {
     /** @var array<int, string|null> */
     public array $cursorsSeen = [];

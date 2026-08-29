@@ -242,13 +242,8 @@ implementing capability interfaces. The engine feature-detects them with
 
 For CRMs whose list APIs paginate by an opaque cursor (HubSpot `after`,
 Pipedrive v2 `cursor`, K2 `NextPageURL`) instead of a numeric offset.
-Implement `fetchContactsPage()`, `fetchAccountsPage()` and
-`fetchCustomEntityPage()` — everything read FROM the CRM — each returning a
-`CursorPage(records, nextCursor)`. `fetchCustomEntityPage()` returns RAW rows
-(flat associative arrays), matching `iterateCustomEntity()`; the other two return
-entities. An adapter with no custom-entity support throws
-`NotSupportedException` from `fetchCustomEntityPage()`, exactly as it already
-does from `iterateCustomEntity()`. The engine hands `nextCursor` back on the
+Implement `fetchContactsPage()` and `fetchAccountsPage()`, each returning a
+`CursorPage(records, nextCursor)`. The engine hands `nextCursor` back on the
 next page, so a drain completes within one run however many pages it takes.
 It is NOT persisted between runs: an interrupted drain restarts from the
 watermark, re-reading pages it already processed rather than resuming past
@@ -259,6 +254,21 @@ searches legitimately return fewer rows than the limit (possibly none at all)
 while more pages remain. Never return the token you were given — a page that
 cannot advance the cursor is treated as an adapter fault and aborts the drain.
 
+
+### `SupportsCustomEntityCursorPaginationInterface`
+
+The same thing for custom entities, which are also read from the CRM: implement
+`fetchCustomEntityPage($entityName, $since, $cursor, $limit)`. It returns RAW rows
+(flat associative arrays) rather than entities, matching `iterateCustomEntity()`;
+`$entityName` is the adapter-interpreted `source` from the entry's config.
+
+It is a **separate** interface from `SupportsCursorPaginationInterface` so that
+adopting it is optional and independent. An adapter that paginates contacts and
+accounts by cursor but has not implemented this keeps the offset path for custom
+entities and keeps loading; one with no custom entities never has to write a
+throwing stub. Implement it if your CRM's list APIs are cursor-only — otherwise
+the custom-entity drain will re-read or skip rows while the other two entities
+page correctly against the same API.
 
 ### `SupportsDealLinkingInterface`
 
@@ -345,6 +355,107 @@ private function getActivityEndpoint(string $type): string
         'meeting' => 'meeting/',
         default => throw AdapterException::createFailed('activity', "Unknown type: {$type}"),
     };
+}
+```
+
+### Deriving a Value From Two Daktela Fields
+
+A mapping rule reads **one** source field, and a transformer sees only that
+scalar. So a value that depends on two fields — the classic case being a call
+state built from `item_direction` × `item_answered` — cannot be produced by the
+mapping engine. Derive it in your adapter.
+
+The SDK deliberately does not derive it for you. `item_*` fields are flattened
+exactly as the platform returned them, and nothing is combined or normalised:
+what a *combination* of Daktela fields means to a given CRM is that CRM's
+business logic, and baking one CRM's vocabulary into the shared Daktela adapter
+makes every other integration inherit it.
+
+**Step 1 — map both source fields through.** Neither is the final value; they are
+the inputs your adapter needs. Give them CRM field names you control:
+
+```yaml
+entity: activity
+lookup_field: external_id
+default:
+  mappings:
+    - { cc_field: name, crm_field: external_id }
+    - { cc_field: title, crm_field: subject }
+    - { cc_field: time_start, crm_field: due_date }
+types:
+  call:
+    mappings:
+      # Inputs for the derivation below. Pass them through untransformed —
+      # the adapter case-folds, because the platform stores the direction
+      # lowercase for calls and emails but UPPERCASE for the chat family
+      # (web, fbm, wap, vbr, igdm).
+      - { cc_field: item_direction, crm_field: _direction }
+      - { cc_field: item_answered,  crm_field: _answered }
+```
+
+**Step 2 — combine them in `upsertActivity()`**, and drop the inputs before the
+payload reaches the API. Leading-underscore names make it obvious they are
+internal:
+
+```php
+public function upsertActivity(string $lookupField, Activity $activity): Activity
+{
+    $payload = $activity->toArray();
+
+    // Case-fold: 'in'/'out' for calls and emails, 'IN'/'OUT' for chats.
+    $direction = strtolower((string) ($payload['_direction'] ?? ''));
+
+    // The v6 API serialises flags as integers, and as the STRINGS "1"/"0" on
+    // some endpoints. empty() handles both: empty("0") is true in PHP, so this
+    // reads 0, "0", null and "" alike as not-answered. Do NOT write
+    // `=== true` (never matches an integer flag) or `(bool) "0"` (which is true).
+    $answered = !empty($payload['_answered']);
+
+    $state = match ($direction) {
+        'in'  => $answered ? 'in_answered'  : 'in_missed',
+        'out' => $answered ? 'out_answered' : 'out_noanswer',
+        // No direction at all is not an internal call — it is an item type that
+        // does not carry one. Keep those out of the missed-call bucket.
+        ''    => 'unknown',
+        default => $answered ? 'internal_answered' : 'internal_noanswer',
+    };
+
+    // Now express it in the CRM's own vocabulary. This is the part that does not
+    // belong in the SDK: `done`, `subject` and `type` are this CRM's fields, and
+    // the rules for filling them are this integration's policy.
+    $payload['done'] = $state === 'in_missed' ? 0 : 1;
+    $payload['type'] = $direction === 'out' ? 'outgoing_call' : 'call';
+    if ($state === 'in_missed') {
+        $payload['subject'] = 'Missed call — ' . ($payload['subject'] ?? '');
+    }
+
+    unset($payload['_direction'], $payload['_answered']);
+
+    return $this->findThenWrite($lookupField, $payload);
+}
+```
+
+**Why not a `value_map` on one field?** Because `done` depends on both. Keying
+`value_map` on `item_answered` alone marks *outgoing* unanswered calls as not
+done; keying it on `item_direction` alone cannot see whether anyone picked up.
+The two-field case is exactly the one the mapping engine cannot express, which is
+why it lands here.
+
+**Testing it.** This is ordinary adapter logic, so test it as such — no sync
+engine required:
+
+```php
+public function testAnUnansweredInboundCallIsNotDone(): void
+{
+    $adapter = new YourCrmAdapter(/* ... */);
+
+    $written = $adapter->upsertActivity('external_id', Activity::fromArray([
+        'external_id' => 'call-1',
+        '_direction'  => 'IN',   // uppercase: the chat-family casing
+        '_answered'   => '0',    // string zero: the v6 serialisation
+    ]));
+
+    self::assertSame(0, $written->get('done'));
 }
 ```
 

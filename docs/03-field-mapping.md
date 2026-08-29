@@ -92,6 +92,10 @@ fields *means* to a particular CRM is that CRM's concern: the SDK ships the
 platform's data faithfully and stays out of the interpretation, so no one CRM's
 vocabulary ends up baked into the shared adapter.
 
+See [Deriving a Value From Two Daktela Fields](04-implementing-crm-adapter.md#deriving-a-value-from-two-daktela-fields)
+for a worked example — the YAML that passes both fields through, and the adapter
+code that turns them into a CRM's `done`/`subject`/`type`.
+
 **`lookup_field` addresses different sides per direction.** On import
 (`crm_to_cc`) the upsert looks up the *CC-side* record, so `lookup_field`
 names a CC field. On export (`cc_to_crm`) the
