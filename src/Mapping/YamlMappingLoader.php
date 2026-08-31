@@ -216,59 +216,7 @@ final class YamlMappingLoader
             );
         }
 
-        $transformers = [];
-        if (isset($item['transformers']) && is_array($item['transformers'])) {
-            foreach ($item['transformers'] as $t) {
-                if (!is_array($t) || !isset($t['name'])) {
-                    throw ConfigurationException::invalidMappingFile(
-                        $filePath,
-                        sprintf('Mapping at index %d: invalid transformer definition', $index),
-                    );
-                }
-                $params = is_array($t['params'] ?? null) ? $t['params'] : [];
-
-                // Timezone names are validated HERE, not at transform time. An
-                // unknown name makes DateTimeZone throw, and because
-                // DateFormatTransformer returns early for an empty value, that
-                // Error would fail only the records that actually carry a date —
-                // a PARTIAL batch failure, which advances the watermark past the
-                // very records it dropped. One typo, permanent silent loss. Same
-                // rule the rest of the config follows: reject at load.
-                foreach (['from_tz', 'to_tz'] as $tzKey) {
-                    if (!isset($params[$tzKey])) {
-                        continue;
-                    }
-                    // Cast inside the guarded region: a non-scalar value (`to_tz: [a, b]`)
-                    // raises "Array to string conversion", which a host that promotes
-                    // warnings to ErrorException would surface instead of the
-                    // ConfigurationException the rest of this loader guarantees.
-                    if (!is_string($params[$tzKey]) && !is_numeric($params[$tzKey])) {
-                        throw ConfigurationException::invalidMappingFile(
-                            $filePath,
-                            sprintf('Mapping at index %d: "%s" must be a timezone name', $index, $tzKey),
-                        );
-                    }
-                    $tz = (string) $params[$tzKey];
-                    // Ask DateTimeZone, do not compare against listIdentifiers():
-                    // that lists only canonical IANA names, while the constructor
-                    // also accepts abbreviations and offsets (CET, GMT, +02:00).
-                    // Matching the list would reject configs that work today.
-                    try {
-                        new \DateTimeZone($tz);
-                    } catch (\Throwable) {
-                        throw ConfigurationException::invalidMappingFile(
-                            $filePath,
-                            sprintf('Mapping at index %d: unknown timezone "%s" for "%s"', $index, $tz, $tzKey),
-                        );
-                    }
-                }
-
-                $transformers[] = [
-                    'name' => (string) $t['name'],
-                    'params' => $params,
-                ];
-            }
-        }
+        $transformers = $this->parseTransformers($item['transformers'] ?? null, $filePath, $index);
 
         $multiValue = null;
         if (isset($item['multi_value']) && is_array($item['multi_value'])) {
@@ -283,6 +231,11 @@ final class YamlMappingLoader
             $multiValue = new MultiValueConfig(
                 strategy: $strategy,
                 separator: (string) ($item['multi_value']['separator'] ?? ','),
+                transformers: $this->parseTransformers(
+                    $item['multi_value']['transformers'] ?? null,
+                    $filePath,
+                    $index,
+                ),
             );
         }
 
@@ -314,5 +267,75 @@ final class YamlMappingLoader
             staticValue: $hasStaticValue ? $item['value'] : null,
             hasStaticValue: $hasStaticValue,
         );
+    }
+
+    /**
+     * Parse and validate a transformer list. Shared by a rule's own transformers
+     * and by those under multi_value, so a date_format buried in a multi_value
+     * block gets the same load-time timezone check as one on the rule itself —
+     * the check exists precisely because failing later fails only SOME records,
+     * which advances the watermark past the ones it dropped.
+     *
+     * @return list<array{name: string, params: array<string, mixed>}>
+     */
+    private function parseTransformers(mixed $raw, string $filePath, int $index): array
+    {
+        $transformers = [];
+        if (!is_array($raw)) {
+            return $transformers;
+        }
+
+        foreach ($raw as $t) {
+            if (!is_array($t) || !isset($t['name'])) {
+                throw ConfigurationException::invalidMappingFile(
+                    $filePath,
+                    sprintf('Mapping at index %d: invalid transformer definition', $index),
+                );
+            }
+            $params = is_array($t['params'] ?? null) ? $t['params'] : [];
+
+            // Timezone names are validated HERE, not at transform time. An
+            // unknown name makes DateTimeZone throw, and because
+            // DateFormatTransformer returns early for an empty value, that
+            // Error would fail only the records that actually carry a date —
+            // a PARTIAL batch failure, which advances the watermark past the
+            // very records it dropped. One typo, permanent silent loss. Same
+            // rule the rest of the config follows: reject at load.
+            foreach (['from_tz', 'to_tz'] as $tzKey) {
+                if (!isset($params[$tzKey])) {
+                    continue;
+                }
+                // Cast inside the guarded region: a non-scalar value (`to_tz: [a, b]`)
+                // raises "Array to string conversion", which a host that promotes
+                // warnings to ErrorException would surface instead of the
+                // ConfigurationException the rest of this loader guarantees.
+                if (!is_string($params[$tzKey]) && !is_numeric($params[$tzKey])) {
+                    throw ConfigurationException::invalidMappingFile(
+                        $filePath,
+                        sprintf('Mapping at index %d: "%s" must be a timezone name', $index, $tzKey),
+                    );
+                }
+                $tz = (string) $params[$tzKey];
+                // Ask DateTimeZone, do not compare against listIdentifiers():
+                // that lists only canonical IANA names, while the constructor
+                // also accepts abbreviations and offsets (CET, GMT, +02:00).
+                // Matching the list would reject configs that work today.
+                try {
+                    new \DateTimeZone($tz);
+                } catch (\Throwable) {
+                    throw ConfigurationException::invalidMappingFile(
+                        $filePath,
+                        sprintf('Mapping at index %d: unknown timezone "%s" for "%s"', $index, $tz, $tzKey),
+                    );
+                }
+            }
+
+            $transformers[] = [
+                'name' => (string) $t['name'],
+                'params' => $params,
+            ];
+        }
+
+        return $transformers;
     }
 }

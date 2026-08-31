@@ -352,6 +352,96 @@ final class FieldMapperTest extends TestCase
         self::assertSame(['vip'], $result['customFields']['tags']);
     }
 
+    /**
+     * Transformers declared under multi_value run ONCE, on the collapsed value.
+     *
+     * Per-rule transformers cannot express this: they run before accumulation,
+     * so each field is transformed in isolation and there is never a point where
+     * the combination exists to be mapped. Combining two fields and then mapping
+     * the pair is the whole reason to join them.
+     */
+    public function testMultiValueTransformersRunOnTheCollapsedValue(): void
+    {
+        $collection = new MappingCollection('contact', 'email', [
+            new FieldMapping('title', 'direction', append: true),
+            new FieldMapping(
+                ccField: 'title',
+                crmField: 'answered',
+                multiValue: new MultiValueConfig(MultiValueStrategy::Join, '_', [
+                    ['name' => 'value_map', 'params' => ['map' => ['out_1' => 'Odchozí hovor (úspěšný)']]],
+                ]),
+                append: true,
+            ),
+        ]);
+
+        $entity = Contact::fromArray(['direction' => 'out', 'answered' => true]);
+
+        $result = $this->mapper->map($entity, $collection, SyncDirection::CrmToCc);
+
+        self::assertSame('Odchozí hovor (úspěšný)', $result['title']);
+    }
+
+    /**
+     * The case this exists for: a call outcome is direction x answered, and the
+     * four results are not compositional — "Zmeškaný hovor" is not "Příchozí
+     * hovor" plus a suffix — so per-field transformers cannot produce them.
+     */
+    public function testTwoFieldsCombineIntoAKeyThatIsThenMapped(): void
+    {
+        $map = [
+            'out_1' => 'Odchozí hovor (úspěšný)',
+            'out_0' => 'Odchozí hovor (neúspěšný)',
+            'in_1' => 'Příchozí hovor',
+            'in_0' => 'Zmeškaný hovor',
+        ];
+
+        $collection = new MappingCollection('contact', 'email', [
+            new FieldMapping('title', 'direction', append: true),
+            new FieldMapping(
+                ccField: 'title',
+                crmField: 'answered',
+                multiValue: new MultiValueConfig(MultiValueStrategy::Join, '_', [
+                    ['name' => 'value_map', 'params' => ['map' => $map, 'default' => 'Hovor']],
+                ]),
+                append: true,
+            ),
+        ]);
+
+        $expected = [
+            ['out', true, 'Odchozí hovor (úspěšný)'],
+            ['out', false, 'Odchozí hovor (neúspěšný)'],
+            ['in', true, 'Příchozí hovor'],
+            ['in', false, 'Zmeškaný hovor'],
+        ];
+
+        foreach ($expected as [$direction, $answered, $want]) {
+            $entity = Contact::fromArray(['direction' => $direction, 'answered' => $answered]);
+            $result = $this->mapper->map($entity, $collection, SyncDirection::CrmToCc);
+
+            self::assertSame($want, $result['title'], sprintf('%s / %s', $direction, var_export($answered, true)));
+        }
+    }
+
+    public function testMultiValueWithoutTransformersIsUnchanged(): void
+    {
+        $collection = new MappingCollection('contact', 'email', [
+            new FieldMapping('title', 'firstName', append: true),
+            new FieldMapping(
+                ccField: 'title',
+                crmField: 'lastName',
+                multiValue: new MultiValueConfig(MultiValueStrategy::Join, ' '),
+                append: true,
+            ),
+        ]);
+
+        $entity = Contact::fromArray(['firstName' => 'Kristýna', 'lastName' => 'Kovandová']);
+
+        self::assertSame(
+            'Kristýna Kovandová',
+            $this->mapper->map($entity, $collection, SyncDirection::CrmToCc)['title'],
+        );
+    }
+
     public function testAppendWithMultiValueJoinCollapsesAccumulatedValues(): void
     {
         $collection = new MappingCollection('contact', 'email', [

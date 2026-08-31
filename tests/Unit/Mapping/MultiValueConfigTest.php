@@ -56,6 +56,29 @@ final class MultiValueConfigTest extends TestCase
         self::assertSame('hello', $config->apply('hello'));
     }
 
+    /**
+     * A joined boolean has to survive as a value, not vanish into an empty slot.
+     *
+     * implode() casts false to "" and true to "1", so `false` came out
+     * indistinguishable from an empty string or a dropped element — and the
+     * whole point of joining several fields is that the result identifies the
+     * combination. Rendered explicitly, `false` is "0".
+     */
+    public function testJoinRendersBooleansAsZeroAndOne(): void
+    {
+        $config = new MultiValueConfig(MultiValueStrategy::Join, '_');
+
+        self::assertSame('out_0', $config->apply(['out', false]));
+        self::assertSame('out_1', $config->apply(['out', true]));
+    }
+
+    public function testJoinDistinguishesFalseFromEmptyString(): void
+    {
+        $config = new MultiValueConfig(MultiValueStrategy::Join, '_');
+
+        self::assertNotSame($config->apply(['x', '']), $config->apply(['x', false]));
+    }
+
     public function testJoinNullReturnsEmpty(): void
     {
         $config = new MultiValueConfig(MultiValueStrategy::Join);

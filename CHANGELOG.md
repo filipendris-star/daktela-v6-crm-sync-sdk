@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`multi_value` accepts its own `transformers`**, applied to the collapsed
+  value. This is the only way to transform a *combination* of source fields: a
+  rule's own transformers run before accumulation, so they only ever see one
+  field. `append` + `multi_value: join` already built a combined key; there was
+  nowhere to map it afterwards.
+
+  The case it exists for is a call outcome — `item_direction` x `item_answered` —
+  whose four results are not compositional, so per-field transformers cannot
+  produce them. Previously the only route was to combine the fields in the CRM
+  adapter, which pushes one deployment's vocabulary into shared code. The labels
+  now stay in that deployment's mapping. See docs/03-field-mapping.md,
+  "Combining two source fields into one value".
+
+  Transformers under `multi_value` go through the same parser as a rule's own, so
+  they get the same load-time validation — notably the timezone check, which
+  exists because failing at transform time fails only the records carrying a date
+  and advances the watermark past them.
+
+### Fixed
+
+- **A joined boolean no longer disappears.** `implode()` casts `false` to `""`,
+  so a joined `false` was indistinguishable from an empty string and from a slot
+  dropped for being empty — fatal when the joined result is meant to identify a
+  combination. Booleans now render as `1`/`0`.
+
 ## 1.2.0
 
 Activity export is the focus of this release: it exports the activity types it

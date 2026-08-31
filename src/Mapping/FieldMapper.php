@@ -84,7 +84,7 @@ final class FieldMapper
             } else {
                 // Apply multi-value strategy if configured
                 if ($mapping->multiValue !== null) {
-                    $value = $mapping->multiValue->apply($value);
+                    $value = $this->applyMultiValue($mapping->multiValue, $value);
                 }
                 $this->setNestedValue($result, $writeField, $value);
             }
@@ -94,7 +94,7 @@ final class FieldMapper
         foreach ($deferredMultiValue as $field => $multiValue) {
             $accumulated = $this->getNestedValue($result, $field);
             if ($accumulated !== null) {
-                $this->setNestedValue($result, $field, $multiValue->apply($accumulated));
+                $this->setNestedValue($result, $field, $this->applyMultiValue($multiValue, $accumulated));
             }
         }
 
@@ -175,6 +175,19 @@ final class FieldMapper
         }
 
         return $value;
+    }
+
+    /**
+     * Run a multi_value strategy, then its own transformers on the result.
+     *
+     * The order is the point. Per-rule transformers run before accumulation, so
+     * they only ever see one field's value; these run after the collapse, which
+     * is the only moment the combination exists. Applied on both the append and
+     * the non-append path so a multi_value block means the same thing either way.
+     */
+    private function applyMultiValue(MultiValueConfig $multiValue, mixed $value): mixed
+    {
+        return $this->applyTransformers($multiValue->apply($value), $multiValue->transformers);
     }
 
     /**

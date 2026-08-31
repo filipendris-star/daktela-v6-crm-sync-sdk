@@ -81,20 +81,56 @@ which the platform stores lowercase (`in`/`out`) for calls and emails but
 uppercase (`IN`/`OUT`) for the chat family. A `value_map` that lists only one
 case sends the rest to its default.
 
-**Deriving values the mapping engine cannot express.** A rule reads one source
-field, and a transformer sees only that scalar, so a value combining *two* fields
-— a call state from `item_direction` × `item_answered`, say — cannot be produced
-by a mapping rule.
+**Combining two source fields into one value.** A rule reads one source field and
+a transformer sees only that scalar, so a value that depends on *two* fields — a
+call state from `item_direction` × `item_answered`, say — cannot come from a
+single rule.
 
-Do it in your CRM adapter, not in the SDK. Map both source fields through to the
-payload and combine them in `upsertActivity()`. What a combination of Daktela
-fields *means* to a particular CRM is that CRM's concern: the SDK ships the
-platform's data faithfully and stays out of the interpretation, so no one CRM's
-vocabulary ends up baked into the shared adapter.
+Build it in config: `append: true` on each source field collects them into an
+array, `multi_value: join` collapses that into one key, and transformers declared
+*under `multi_value`* map the key to the value you want. Those run after the
+collapse, which is the only point at which the combination exists; a rule's own
+transformers run before it, on one field at a time.
 
-See [Deriving a Value From Two Daktela Fields](04-implementing-crm-adapter.md#deriving-a-value-from-two-daktela-fields)
-for a worked example — the YAML that passes both fields through, and the adapter
-code that turns them into a CRM's `done`/`subject`/`type`.
+```yaml
+- cc_field: item_direction
+  crm_field: subject
+  append: true
+- cc_field: item_answered
+  crm_field: subject
+  append: true
+  multi_value:
+    strategy: join
+    separator: '_'
+    transformers:
+      - name: value_map
+        params:
+          map:
+            out_1: 'Outgoing call'
+            out_0: 'Outgoing call (no answer)'
+            in_1:  'Incoming call'
+            in_0:  'Missed call'
+          default: 'Call'
+```
+
+Order is the rule order in the file, so the key here is `direction_answered`.
+Booleans render as `1`/`0`.
+
+Two traps worth knowing:
+
+- **A base rule targeting the same field is joined INTO the key.** An `append`
+  type rule does not displace a non-append base rule (see
+  `MappingCollection::forType`), so a `default:` block mapping `title → subject`
+  would leave you joining `+420777123456_out_1`. Give each type its own rule for
+  a field built this way, rather than a base rule plus appends.
+- **A `null` or empty source is dropped, not kept as an empty slot**, so the key
+  loses a position and `out` cannot be told from `out` + missing. Only combine
+  fields that are always present, or make the absent case a distinct value first.
+
+When the *interpretation* is genuinely CRM-specific rather than a value the
+config can name, do it in your CRM adapter instead: map both source fields
+through to the payload and combine them in `upsertActivity()`. See
+[Deriving a Value From Two Daktela Fields](04-implementing-crm-adapter.md#deriving-a-value-from-two-daktela-fields).
 
 **`lookup_field` addresses different sides per direction.** On import
 (`crm_to_cc`) the upsert looks up the *CC-side* record, so `lookup_field`
@@ -219,6 +255,10 @@ For each field mapping, processing happens in this order:
 5. Write to target (append or set)
 
 For `append` fields, the `multi_value` strategy is deferred — it runs once after all values for that target field are accumulated. This allows `multi_value: join` to collapse the final array into a string.
+
+`multi_value` may carry its own `transformers`, applied to the collapsed value
+(step 4b). They are the only way to transform a combination of fields: a rule's
+own transformers run at step 2, before accumulation.
 
 ---
 

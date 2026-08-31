@@ -291,9 +291,12 @@ final class DaktelaAdapter implements ContactCentreAdapterInterface
      * deciding what a combination of fields MEANS to a given CRM is the CRM
      * adapter's job, and a derived token shaped by one CRM's vocabulary does not
      * belong in a universal SDK. A CRM that needs, say, a single call-state value
-     * from `item_direction` × `item_answered` maps both fields through and combines
-     * them in its own adapter. See docs/03-field-mapping.md, "Deriving values the
-     * mapping engine cannot express".
+     * from `item_direction` × `item_answered` builds it in ITS OWN MAPPING: append
+     * both fields to one target, join them, and map the resulting key with
+     * transformers declared under `multi_value`. See docs/03-field-mapping.md,
+     * "Combining two source fields into one value". Where the interpretation is
+     * genuinely CRM-specific rather than a value the config can name, combine them
+     * in the CRM adapter instead.
      *
      * One quirk worth knowing when you do: the platform is not consistent about
      * direction casing — call and email items store 'in'/'out' while the chat family

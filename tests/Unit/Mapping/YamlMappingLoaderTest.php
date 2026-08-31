@@ -136,6 +136,58 @@ final class YamlMappingLoaderTest extends TestCase
      * dropped. Every other config value in this release is validated at load;
      * so is this one.
      */
+    public function testMultiValueTransformersAreLoaded(): void
+    {
+        $file = $this->writeTempMapping(<<<'YAML'
+            entity: activity
+            lookup_field: external_id
+            mappings:
+              - cc_field: item_direction
+                crm_field: subject
+                append: true
+                multi_value:
+                  strategy: join
+                  separator: '_'
+                  transformers:
+                    - name: value_map
+                      params: { map: { out_1: 'Odchozi hovor' } }
+            YAML);
+
+        $mapping = $this->loader->load($file)->mappings[0];
+
+        self::assertNotNull($mapping->multiValue);
+        self::assertSame('_', $mapping->multiValue->separator);
+        self::assertSame('value_map', $mapping->multiValue->transformers[0]['name']);
+        self::assertSame(['out_1' => 'Odchozi hovor'], $mapping->multiValue->transformers[0]['params']['map']);
+    }
+
+    /**
+     * multi_value transformers go through the same parser as a rule's own, so
+     * the load-time timezone check covers them too. It has to: rejecting at
+     * transform time would fail only the records carrying a date, which is a
+     * partial batch failure and advances the watermark past them.
+     */
+    public function testAnUnknownTimezoneUnderMultiValueIsAlsoRejectedAtLoadTime(): void
+    {
+        $file = $this->writeTempMapping(<<<'YAML'
+            entity: activity
+            lookup_field: external_id
+            mappings:
+              - cc_field: time
+                crm_field: due_date
+                append: true
+                multi_value:
+                  strategy: join
+                  transformers:
+                    - name: date_format
+                      params: { from: 'Y-m-d', to: 'c', to_tz: 'Europe/Praha' }
+            YAML);
+
+        $this->expectException(ConfigurationException::class);
+        $this->expectExceptionMessageMatches('/unknown timezone "Europe\/Praha" for "to_tz"/');
+        $this->loader->load($file);
+    }
+
     public function testUnknownTimezoneIsRejectedAtLoadTime(): void
     {
         $file = $this->writeTempMapping(<<<'YAML'
